@@ -11,3 +11,5 @@ mc ls -r local/datasets/
 mc alias list
 mc ls -r local/datasets/
 mc anonymous get local/datasets
+cd /home/elastic/ESQL-DataFederation/Scripts
+mc cp --recursive transactions_history/ local/datasets/transactions/
