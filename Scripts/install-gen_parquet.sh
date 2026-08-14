@@ -1,7 +1,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install pandas numpy elasticsearch faker pyarrow 
-cd /home/elastic/ESQL-DataFederation/Scripts && ./.venv/bin/python gen_parquet.py --rows 5000000
+cd /home/elastic/ESQL-DataFederation/Scripts && ./.venv/bin/python gen_parquet.py --rows 50000
 mc alias set local http://localhost:9000 minioadmin 'datafederation_hooray!'
 mc admin info local
 mc mb local/datasets
