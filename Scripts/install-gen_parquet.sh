@@ -11,3 +11,5 @@ mc alias list
 mc ls -r local/datasets/
 cd /home/elastic/ESQL-DataFederation/Scripts
 mc cp --recursive transactions_history/ local/datasets/transactions/
+cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_parquet_logs.py
+mc cp --recursive app_logs.parquet local/datasets/app_logs/
