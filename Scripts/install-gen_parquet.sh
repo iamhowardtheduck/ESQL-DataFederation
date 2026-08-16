@@ -13,6 +13,8 @@ cd /home/elastic/ESQL-DataFederation/Scripts
 mc cp --recursive transactions_history/ local/datasets/transactions/
 cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_parquet_logs.py --rows 2000000 --days 30 --suspicious-rate 0.06
 mc cp --recursive app_logs.parquet local/datasets/logs/
+cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_hr_csv.py --out hr_roster.csv
+mc cp --recursive hr_roster.csv local/datasets/hr/
 clear
 echo ""
 echo ""
