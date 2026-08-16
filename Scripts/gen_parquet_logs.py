@@ -8,6 +8,20 @@ combined access logs, syslog, HikariCP pool warnings, JVM GC lines, Kafka
 consumer output, embedded JSON, HAProxy, Envoy, WAF/ModSecurity, IIS W3C,
 CEF/SIEM, Postgres, Redis, and multi-line Java stack traces.
 
+NESTED JSON DOCUMENTS
+    Co-mixed with the plain-text lines above, ~18% of rows are structured
+    telemetry documents rather than log lines -- object graphs with arrays of
+    objects, up to 7 levels deep. These need real JSON parsing, not GROK:
+
+        otel_span     OpenTelemetry span: resource.attributes.k8s.pod.name,
+                      span.events[] with nested exception attributes, span.links[]
+        audit_event   ECS-style audit record: actor.session.mfa, source.geo,
+                      changes[] with from/to pairs, labels.compliance[]
+        payment_auth  card authorization: card.bin, device.geo,
+                      risk.rules[] with per-rule score and action
+
+    ~6% are pretty-printed rather than compact, as real applications do.
+
 Nothing is pre-parsed. The point is to force DISSECT / GROK / regex work at
 query time, which is the interesting part of querying object storage from ES|QL.
 
@@ -35,6 +49,7 @@ Usage:
 """
 import argparse
 import ipaddress
+import json
 import os
 import random
 from datetime import datetime, timedelta, timezone
@@ -43,6 +58,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 MAX_ACCOUNT_ID = 35_000
+
+# Order documents are capped: they are far larger than log lines, so an
+# unbounded share would dominate file size without adding query variety.
+ORDER_CAP = 100_000
 PERSONA_ACCOUNTS = (
     list(range(2, 22, 2))
     + [32687, 16384, 8192, 4096, 2048]
@@ -180,6 +199,42 @@ TRACE_EXCEPTIONS = [
     ("com.austinbank.auth.TokenValidationException",
      "JWT signature does not match locally computed signature"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Order documents are borrowed from gen_parquet_orders.py rather than
+# duplicated here, so the two generators can never drift apart. The file is
+# located next to this one; if it is missing, order events are skipped with a
+# warning instead of failing the run.
+# ---------------------------------------------------------------------------
+_ORDERS_MOD = None
+_ORDERS_TRIED = False
+
+
+def _orders_module():
+    global _ORDERS_MOD, _ORDERS_TRIED
+    if _ORDERS_TRIED:
+        return _ORDERS_MOD
+    _ORDERS_TRIED = True
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "gen_parquet_orders.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("gen_parquet_orders", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _ORDERS_MOD = mod
+    return mod
+
+
+def order_event(ts, seq, now, customers):
+    """One e-commerce order document, timestamped at ts."""
+    mod = _orders_module()
+    if mod is None:
+        return None
+    doc = mod.build_order(seq, now, ts, ts, customers)
+    return json.dumps(doc, separators=(",", ":"))
 
 
 def rid():
@@ -507,6 +562,293 @@ def jsonish(ts, stressed, srate):
                 random.choice([200, 200, 200, 201, 400, 401, 403, 500])))
 
 
+# ---------------------------------------------------------------------------
+# Nested JSON documents.
+#
+# A deliberately different data type from everything above: these are not log
+# LINES to be GROK'd, they are structured telemetry documents with object
+# graphs and arrays of objects. Parsing them needs real JSON handling, not
+# DISSECT, which makes them the interesting half of a mixed-format dataset.
+#
+# Three document kinds, all co-mixed with the plain-text formats:
+#   otel_span     distributed trace span (resource + attributes + events[])
+#   audit_event   security audit record  (actor + target + changes[])
+#   payment_auth  card authorization     (card + merchant + risk.rules[])
+# ---------------------------------------------------------------------------
+REGIONS = ["us-east-2", "us-west-1", "eu-west-1", "us-east-1"]
+K8S_NS = ["banking-prod", "banking-edge", "banking-batch"]
+CARD_BRANDS = ["visa", "mastercard", "amex", "discover"]
+MCC = ["5411", "5541", "5812", "5732", "4900", "6011", "5999", "7011"]
+MERCHANTS = ["Northgate Fuel", "Copperline Market", "Allegheny Hardware",
+             "Blue Ridge Pharmacy", "Steel City Electronics", "Riverside Grocers",
+             "Monongahela Wine", "Duquesne Dry Goods", "Ohio Valley Freight"]
+RISK_RULES = [
+    ("R101", "velocity_24h"), ("R204", "geo_mismatch"),
+    ("R310", "device_unrecognized"), ("R415", "amount_outlier"),
+    ("R502", "merchant_blacklist"), ("R608", "cnp_high_risk"),
+    ("R711", "bin_country_mismatch"), ("R820", "impossible_travel"),
+]
+AUDIT_ACTIONS = [
+    ("account.read", "account"), ("account.update", "account"),
+    ("payee.create", "payee"), ("payee.delete", "payee"),
+    ("role.grant", "principal"), ("role.revoke", "principal"),
+    ("export.generate", "report"), ("session.revoke", "session"),
+    ("limit.override", "account"), ("apikey.create", "credential"),
+]
+
+
+def _geo_for(cip):
+    """Suspicious host reports inconsistent geo -- an impossible-travel signal."""
+    if cip == SUSPICIOUS_IP:
+        return random.choice([
+            {"country": "RO", "city": "Bucharest", "lat": 44.4268, "lon": 26.1025},
+            {"country": "NG", "city": "Lagos", "lat": 6.5244, "lon": 3.3792},
+            {"country": "RU", "city": "Saint Petersburg", "lat": 59.9311, "lon": 30.3609},
+            {"country": "US", "city": "Austin", "lat": 30.2672, "lon": -97.7431},
+        ])
+    return random.choice([
+        {"country": "US", "city": "Austin", "lat": 30.2672, "lon": -97.7431},
+        {"country": "US", "city": "Pittsburgh", "lat": 40.4406, "lon": -79.9959},
+        {"country": "US", "city": "Round Rock", "lat": 30.5083, "lon": -97.6789},
+        {"country": "US", "city": "Cedar Park", "lat": 30.5052, "lon": -97.8203},
+    ])
+
+
+def _dumps(doc):
+    """Compact by default; occasionally pretty-printed, as real apps do."""
+    if random.random() < 0.06:
+        return json.dumps(doc, indent=2)
+    return json.dumps(doc, separators=(",", ":"))
+
+
+def otel_span(ts, stressed, srate):
+    svc = random.choice(SERVICES)
+    cip = client_ip(srate)
+    bad = cip == SUSPICIOUS_IP
+    dur = (random.randrange(40_000_000, 900_000_000) if stressed
+           else random.randrange(150_000, 40_000_000))
+    err = (random.random() < (0.35 if stressed else 0.06)) or (bad and random.random() < 0.4)
+    a = acct()
+
+    events = []
+    if random.random() < 0.6:
+        events.append({
+            "name": "db.query",
+            "timeUnixNano": int(ts.timestamp() * 1e9) + random.randrange(1000, 90000),
+            "attributes": {
+                "db.system": "postgresql",
+                "db.statement": random.choice(SQL),
+                "db.rows_affected": random.randrange(0, 400),
+            },
+        })
+    if err:
+        exc, detail = random.choice(TRACE_EXCEPTIONS)
+        events.append({
+            "name": "exception",
+            "timeUnixNano": int(ts.timestamp() * 1e9) + random.randrange(1000, 90000),
+            "attributes": {
+                "exception.type": exc,
+                "exception.message": detail,
+                "exception.escaped": random.choice([True, False]),
+            },
+        })
+
+    region = random.choice(REGIONS)
+    doc = {
+        "resource": {
+            "attributes": {
+                "service.name": svc,
+                "service.version": f"4.{random.randrange(8, 14)}.{random.randrange(0, 9)}",
+                "deployment.environment": "production",
+                "cloud": {"provider": "aws", "region": region,
+                          "availability_zone": region + random.choice("abc")},
+                "k8s": {"namespace": random.choice(K8S_NS),
+                        "pod": {"name": f"{svc}-{rid()[:9]}-{rid()[:5]}",
+                                "uid": rid() + rid()},
+                        "node": {"name": random.choice(HOSTS)}},
+                "host": {"name": random.choice(HOSTS), "arch": "amd64"},
+            }
+        },
+        "scope": {"name": "io.opentelemetry.spring-webmvc", "version": "2.4.0"},
+        "span": {
+            "traceId": rid() + rid(),
+            "spanId": rid(),
+            "parentSpanId": rid() if random.random() < 0.8 else None,
+            "name": f"{random.choice(['GET', 'POST'])} {random.choice(ENDPOINTS)}",
+            "kind": "SPAN_KIND_SERVER",
+            "startTimeUnixNano": int(ts.timestamp() * 1e9),
+            "endTimeUnixNano": int(ts.timestamp() * 1e9) + dur,
+            "status": {"code": "STATUS_CODE_ERROR" if err else "STATUS_CODE_OK",
+                       "message": "handler threw" if err else ""},
+            "attributes": {
+                "http": {
+                    "request": {"method": random.choice(["GET", "POST", "PUT"]),
+                                "header": {"user_agent": random.choice(
+                                    BAD_AGENTS if bad else AGENTS)}},
+                    "response": {"status_code": random.choice(
+                        [401, 403, 429, 500] if bad else
+                        ([500, 503, 504] if err else [200, 200, 201, 204]))},
+                    "route": random.choice(ENDPOINTS),
+                },
+                "client": {"address": cip, "port": random.randrange(30000, 65000)},
+                "enduser": {"id": random.choice(TARGET_USERS if bad else USERS),
+                            "accountId": a},
+                "net": {"peer": {"name": f"{svc}.svc.cluster.local"},
+                        "protocol": {"name": "http", "version": "2"}},
+            },
+            "events": events,
+            "links": ([{"traceId": rid() + rid(), "spanId": rid(),
+                        "attributes": {"link.type": "follows_from"}}]
+                      if random.random() < 0.15 else []),
+        },
+    }
+    return _dumps(doc)
+
+
+def audit_event(ts, stressed, srate):
+    cip = client_ip(srate)
+    bad = cip == SUSPICIOUS_IP
+    action, target_type = random.choice(
+        [("role.grant", "principal"), ("export.generate", "report"),
+         ("apikey.create", "credential"), ("limit.override", "account"),
+         ("account.read", "account")] if bad else AUDIT_ACTIONS)
+    outcome = ("denied" if bad and random.random() < 0.7
+               else random.choices(["allowed", "denied"], weights=[0.93, 0.07])[0])
+    a = acct()
+    geo = _geo_for(cip)
+
+    changes = []
+    if action.endswith((".update", ".grant", ".revoke", ".override")):
+        for _ in range(random.randrange(1, 4)):
+            field, old, new = random.choice([
+                ("daily_limit", random.randrange(1000, 5000), random.randrange(5000, 90000)),
+                ("role", "viewer", random.choice(["operator", "admin", "auditor"])),
+                ("status", "active", random.choice(["restricted", "frozen"])),
+                ("mfa_required", True, False),
+                ("notification_email", "user@example.com", "attacker@mail.test"),
+            ])
+            changes.append({"field": field, "from": old, "to": new})
+
+    doc = {
+        "@timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z",
+        "event": {
+            "kind": "event", "category": ["iam" if "role" in action else "database"],
+            "action": action, "outcome": outcome,
+            "severity": 8 if bad else random.randrange(1, 5),
+            "risk_score": round(random.uniform(0.62, 0.99) if bad
+                                else random.uniform(0.0, 0.35), 3),
+        },
+        "actor": {
+            "principal": {"id": f"usr_{rid()[:12]}",
+                          "name": random.choice(TARGET_USERS if bad else USERS),
+                          "type": random.choice(["human", "human", "service_account"])},
+            "session": {"id": rid(), "mfa": {"satisfied": not bad,
+                                             "method": random.choice(["totp", "webauthn", "sms", None])}},
+            "roles": random.sample(["viewer", "operator", "auditor", "admin",
+                                    "support", "treasury"], k=random.randrange(1, 4)),
+        },
+        "source": {
+            "ip": cip, "port": random.randrange(30000, 65000),
+            "geo": geo,
+            "user_agent": {"original": random.choice(BAD_AGENTS if bad else AGENTS),
+                           "device": {"name": random.choice(["desktop", "mobile", "unknown"])}},
+            "network": {"asn": random.randrange(1000, 65000),
+                        "vpn_detected": bad and random.random() < 0.6},
+        },
+        "target": {
+            "type": target_type,
+            "id": f"{target_type[:3]}_{rid()[:10]}",
+            "accountId": a,
+            "attributes": {"tier": random.choice(["retail", "premier", "business"]),
+                           "region": random.choice(REGIONS)},
+        },
+        "changes": changes,
+        "trace": {"id": rid() + rid(), "span": {"id": rid()}},
+        "labels": {"env": "production", "compliance": random.sample(
+            ["sox", "pci-dss", "glba", "ffiec"], k=random.randrange(1, 3))},
+    }
+    return _dumps(doc)
+
+
+def payment_auth(ts, stressed, srate):
+    cip = client_ip(srate)
+    bad = cip == SUSPICIOUS_IP
+    a = acct()
+    amount = round(random.lognormvariate(4.2, 1.3) * (6 if bad else 1), 2)
+
+    fired = []
+    n_rules = random.randrange(2, 5) if bad else random.randrange(0, 3)
+    for code, name in random.sample(RISK_RULES, k=min(n_rules, len(RISK_RULES))):
+        fired.append({
+            "code": code, "name": name,
+            "score": round(random.uniform(0.55, 0.99) if bad
+                           else random.uniform(0.05, 0.5), 3),
+            "action": random.choice(["review", "decline", "challenge"]) if bad else "monitor",
+        })
+    total = round(sum(r["score"] for r in fired) / max(1, len(fired)), 3)
+    decision = ("declined" if bad and total > 0.6 else
+                random.choices(["approved", "declined", "challenged"],
+                               weights=[0.9, 0.06, 0.04])[0])
+
+    channel = random.choice(["card_present", "card_not_present",
+                             "recurring", "wallet"])
+    entry_mode = {
+        "card_present": lambda: random.choice(["chip", "contactless", "swipe"]),
+        "card_not_present": lambda: random.choice(["ecom", "manual", "moto"]),
+        "recurring": lambda: "stored_credential",
+        "wallet": lambda: random.choice(["contactless", "ecom"]),
+    }[channel]()
+
+    doc = {
+        "@timestamp": ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z",
+        "event": {"dataset": "banking.authorization", "type": ["access"],
+                  "outcome": "success" if decision == "approved" else "failure"},
+        "transaction": {
+            "id": f"AUTH-{rid()[:12].upper()}",
+            "accountId": a,
+            "amount": {"value": amount, "currency": "USD"},
+            "channel": channel,
+            "entry_mode": entry_mode,
+            "decision": decision,
+        },
+        "card": {
+            "brand": random.choice(CARD_BRANDS),
+            "last4": f"{random.randrange(1000, 9999)}",
+            "bin": {"number": f"{random.randrange(400000, 560000)}",
+                    "country": random.choice(["US", "US", "US", "GB", "RO", "NG"])
+                    if bad else "US"},
+            "expiry": {"month": random.randrange(1, 13),
+                       "year": random.randrange(2026, 2032)},
+            "token": {"id": rid() + rid()[:8], "provider": "tsp-01"},
+        },
+        "merchant": {
+            "name": random.choice(MERCHANTS),
+            "mcc": random.choice(MCC),
+            "location": {"city": "Austin", "state": "TX", "country": "US"},
+            "acquirer": {"id": f"ACQ{random.randrange(100, 999)}",
+                         "name": random.choice(["FirstData", "Elavon", "Worldpay"])},
+        },
+        "device": {
+            "fingerprint": rid() + rid()[:4],
+            "ip": cip,
+            "geo": _geo_for(cip),
+            "trusted": not bad,
+            "attributes": {"os": random.choice(["iOS 18.2", "Android 15",
+                                                "Windows 11", "macOS 15.3"]),
+                           "rooted": bad and random.random() < 0.4},
+        },
+        "risk": {
+            "score": total,
+            "model": {"name": "xgb-auth", "version": f"v{random.randrange(3, 7)}"},
+            "rules": fired,
+            "reason_codes": [r["name"] for r in fired],
+        },
+        "ledger": {"posting": {"status": "pending" if decision == "approved" else "void",
+                               "journalId": f"JRN-{random.randrange(10**7, 10**8)}"}},
+    }
+    return _dumps(doc)
+
+
 def stacktrace(ts, stressed, srate):
     exc, detail = random.choice(TRACE_EXCEPTIONS)
     svc = random.choice(SERVICES)
@@ -588,10 +930,13 @@ def campaign_line(ts, phase):
 
 
 FORMATS = [
-    (log4j, 0.26), (nginx, 0.20), (jsonish, 0.10), (syslog, 0.08),
-    (haproxy, 0.06), (envoy, 0.05), (kafka, 0.05), (postgres, 0.05),
-    (cef, 0.04), (hikari, 0.03), (gc, 0.03), (iis, 0.02), (redis, 0.01),
-    (waf, 0.01), (stacktrace, 0.01),
+    # plain-text log lines (GROK / DISSECT territory)
+    (log4j, 0.22), (nginx, 0.17), (syslog, 0.07), (haproxy, 0.05),
+    (envoy, 0.04), (kafka, 0.04), (postgres, 0.04), (cef, 0.03),
+    (hikari, 0.025), (gc, 0.025), (iis, 0.02), (redis, 0.01),
+    (waf, 0.01), (stacktrace, 0.01), (jsonish, 0.06),
+    # nested JSON documents (real JSON parsing territory) -- 18% combined
+    (otel_span, 0.07), (audit_event, 0.06), (payment_auth, 0.05),
 ]
 FNS = [f for f, _ in FORMATS]
 WTS = [w for _, w in FORMATS]
@@ -606,6 +951,11 @@ def main():
                     help="number of pool-saturation bursts to weave in")
     ap.add_argument("--campaigns", type=int, default=4,
                     help="number of attack bursts from the suspicious IP")
+    ap.add_argument("--orders", type=int, default=-1,
+                    help="number of e-commerce order documents to co-mix "
+                         "(default: 10%% of --rows; hard cap %d)" % ORDER_CAP)
+    ap.add_argument("--order-customers", type=int, default=20_000,
+                    help="distinct customer pool for order documents")
     ap.add_argument("--suspicious-rate", type=float, default=0.03,
                     help="baseline share of client-IP lines using %s "
                          "(0 disables the malicious actor entirely)" % SUSPICIOUS_IP)
@@ -614,6 +964,13 @@ def main():
 
     random.seed(args.seed)
     _build_client_pool(random.Random(args.seed))
+
+    n_orders = args.rows // 10 if args.orders < 0 else args.orders
+    n_orders = max(0, min(n_orders, ORDER_CAP, args.rows))
+    if n_orders and _orders_module() is None:
+        print("warning: gen_parquet_orders.py not found next to this script - "
+              "skipping order documents")
+        n_orders = 0
 
     srate = max(0.0, min(1.0, args.suspicious_rate))
     end = datetime.now(timezone.utc)
@@ -662,14 +1019,28 @@ def main():
             stamps.append(t)
     stamps.sort()
 
+    # Which positions in the sorted stream carry an order document. Chosen up
+    # front so orders stay evenly spread across the window rather than
+    # clustering, and so the total row count still equals --rows exactly.
+    order_slots = set(random.sample(range(len(stamps)), n_orders)) if n_orders else set()
+
     messages = []
     susp_lines = 0
-    for t in stamps:
+    order_seq = 0
+    order_rows = 0
+    for i, t in enumerate(stamps):
         ts = datetime.fromtimestamp(t, tz=timezone.utc)
         hot = stressed_at(t)
         phase = campaign_at(t)
 
-        if phase and random.random() < 0.55:
+        if i in order_slots:
+            order_seq += 1
+            line = order_event(ts, order_seq, end, args.order_customers)
+            if line is None:                      # module vanished mid-run
+                line = jsonish(ts, hot, srate)
+            else:
+                order_rows += 1
+        elif phase and random.random() < 0.55:
             line = campaign_line(ts, phase)
         else:
             fn = random.choices(FNS, weights=WTS)[0]
@@ -692,6 +1063,8 @@ def main():
     print(f"  client IPs : 10.30.255.0 .. 10.50.255.0 ({_POOL_SIZE} distinct)")
     print(f"  incidents  : {args.incidents} pool-saturation bursts")
     print(f"  campaigns  : {len(campaigns)} attack bursts from {SUSPICIOUS_IP}")
+    print(f"  orders     : {order_rows:,} order documents "
+          f"({order_rows / max(1, len(messages)) * 100:.1f}% of rows, cap {ORDER_CAP:,})")
     print(f"  suspicious : {susp_lines:,} lines "
           f"({susp_lines / max(1, len(messages)) * 100:.2f}% of total)")
 
