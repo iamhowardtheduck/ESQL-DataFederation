@@ -15,7 +15,12 @@ cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_parquet_log
 mc cp --recursive app_logs.parquet local/datasets/logs/
 cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_hr_csv.py --out hr_roster.csv
 mc cp --recursive hr_roster.csv local/datasets/hr/
+cd /home/elastic/ESQL-DataFederation/Scripts && .venv/bin/python gen_parquet_orders.py --rows 50000 --ndjson orders.ndjson
+mc cp --recursive orders.ndjson local/datasets/orders/
 clear
+echo ""
+echo "Generated transactions and logs as parquet format, HR-based data as CSV, and orders as ndjson"
+echo ""
 echo ""
 echo ""
 echo "You are now ready to begin the assignment."
