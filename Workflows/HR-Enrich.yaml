@@ -1,0 +1,69 @@
+version: "1"
+name: "HR Directory IP Enrichment"
+description: >
+  Queries hr_directory via ES|QL (converting IP_Address to an IP type), then for each
+  HR record runs an _update_by_query against logs-* scoped by a caller-provided query.
+  Any log document whose client.ip, source.ip, or host.ip matches the HR record's IP
+  is enriched with Department, Sub-Department, and Start-Date from hr_directory.
+enabled: true
+triggers:
+  - type: manual
+inputs:
+  logs_query:
+    type: string
+    description: >
+      Query (Lucene/query_string syntax) scoping which logs-* documents are candidates
+      for enrichment. Provided by the user or derived from context (Discover, alerts, etc).
+      Defaults to all documents.
+    default: "*"
+    required: false
+steps:
+  - name: get_hr_records
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: >
+        FROM hr_directory
+        | EVAL hr_ip = TO_IP(`IP_Address`)
+        | WHERE hr_ip IS NOT NULL
+        | KEEP hr_ip, `Department`, `Sub-Department`, `Start_Date`
+        | LIMIT 10000
+
+  - name: enrich_matching_logs
+    type: foreach
+    foreach: "{{ steps.get_hr_records.output.values | json }}"
+    steps:
+      - name: update_logs_for_hr_ip
+        type: elasticsearch.request
+        with:
+          method: POST
+          path: "/logs-*/_update_by_query?conflicts=proceed&ignore_unavailable=true"
+          body:
+            query:
+              bool:
+                must:
+                  - query_string:
+                      query: "{{ inputs.logs_query }}"
+                should:
+                  - term:
+                      client.ip: "{{ foreach.item[0] }}"
+                  - term:
+                      source.ip: "{{ foreach.item[0] }}"
+                  - term:
+                      host.ip: "{{ foreach.item[0] }}"
+                minimum_should_match: 1
+            script:
+              lang: painless
+              source: >
+                ctx._source['Department'] = params.department;
+                ctx._source['Sub-Department'] = params.sub_department;
+                ctx._source['Start-Date'] = params.start_date;
+              params:
+                department: "{{ foreach.item[1] }}"
+                sub_department: "{{ foreach.item[2] }}"
+                start_date: "{{ foreach.item[3] }}"
+
+  - name: report_summary
+    type: console
+    with:
+      message: "Enrichment complete. Processed {{ steps.get_hr_records.output.values | size }} hr_directory records against logs-* scoped by query: {{ inputs.logs_query }}"
