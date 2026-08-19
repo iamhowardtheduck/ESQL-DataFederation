@@ -12,10 +12,10 @@ version: "1"
 inputs:
   - name: logs_query
     type: string
-    required: true
+    required: false
     description: >
-      A document-level ES|QL query targeting logs-* supplied by the user
-      or investigation context. Do not invent a logs-* query.
+      Optional document-level ES|QL query targeting logs-*. If omitted,
+      the workflow builds a query from the triggering event document.
 
 triggers:
   - type: manual
@@ -26,12 +26,26 @@ settings:
 steps:
 
   # ------------------------------------------------------------
-  # Normalize the ES|QL query supplied by the user/context
+  # Resolve the effective query:
+  #   1. logs_query input if supplied (Manual mode / API / agent)
+  #   2. event.documents (Test dialog Document mode; supports
+  #      multi-select via _id IN (...))
+  #   3. event.alerts (real alert-triggered runs)
+  # ------------------------------------------------------------
+
+  - name: resolve_query
+    type: data.set
+    with:
+      effective_query: >-
+        {% if inputs.logs_query and inputs.logs_query != "" %}{{ inputs.logs_query }}{% elsif event.documents %}FROM logs-* METADATA _index, _id | WHERE _id IN ({% for d in event.documents %}"{{ d.id }}"{% unless forloop.last %}, {% endunless %}{% endfor %}){% elsif event.alerts %}FROM logs-* METADATA _index, _id | WHERE _id IN ({% for a in event.alerts %}"{{ a._id }}"{% unless forloop.last %}, {% endunless %}{% endfor %}){% endif %}
+
+  # ------------------------------------------------------------
+  # Normalize the ES|QL query
   # ------------------------------------------------------------
 
   - name: remove_trailing_semicolon
     type: data.regexReplace
-    source: "${{ inputs.logs_query }}"
+    source: "${{ steps.resolve_query.output.effective_query }}"
     with:
       pattern: ';\s*$'
       replacement: ''
@@ -65,9 +79,7 @@ steps:
       flags: "im"
 
   # ------------------------------------------------------------
-  # Execute the user/context supplied logs-* query.
-  #
-  # KEEP gives us a predictable ES|QL result:
+  # Execute the resolved logs-* query.
   #
   #   [0] _index
   #   [1] _id
@@ -84,7 +96,7 @@ steps:
         | KEEP _index, _id, client.ip, source.ip, host.ip
 
   # ------------------------------------------------------------
-  # Process every document returned by the provided query
+  # Process every document returned by the resolved query
   # ------------------------------------------------------------
 
   - name: enrich_each_log
@@ -92,7 +104,7 @@ steps:
     foreach: "${{ steps.query_logs.output.values }}"
 
     max-iterations:
-      limit: 2000
+      limit: 1
       on-limit: fail
 
     steps:
@@ -108,17 +120,8 @@ steps:
           host_ip: "{{ foreach.item[4] | default: '' }}"
 
       # --------------------------------------------------------
-      # Query HR directory.
-      #
-      # Convert IP_Address from string/keyword -> ip.
-      #
-      # Match priority:
-      #   1. client.ip
-      #   2. source.ip
-      #   3. host.ip
-      #
-      # The priority only matters if a single log event happens
-      # to contain multiple IPs belonging to different HR rows.
+      # Query HR directory. Match priority:
+      #   1. client.ip  2. source.ip  3. host.ip
       # --------------------------------------------------------
 
       - name: lookup_hr
@@ -139,9 +142,6 @@ steps:
             | LIMIT 1
 
       # --------------------------------------------------------
-      # If lookup_hr returns no rows, this foreach performs
-      # zero iterations and the original document is untouched.
-      #
       # If an HR match exists, update that exact logs-* document.
       # --------------------------------------------------------
 
