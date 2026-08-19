@@ -1,281 +1,168 @@
-version: "1"
-name: hr-directory-enrichment
-description: >
-  Enriches security alerts or base events with employee identity data from the
-  hr_directory dataset. When triggered by a security detection rule, it updates the
-  alert document(s) in .internal.alerts-security.alerts-default-*. When run manually
-  (or as an Agent Builder tool), the caller can target a single document, a single
-  alert, a KQL query, or an ES|QL WHERE expression. hr_directory is queried
-  exclusively via ES|QL. IP_Address (keyword) in hr_directory is matched against
-  source.ip, client.ip, and host.ip (ip type) on the target documents, and matching
-  HR fields are written under the corresponding prefix (source.*, client.*, host.*).
+name: hr--enrich-logs-by-ip
+description: Enrich matching logs-* documents with HR Department, Sub-Department, and Start-Date using IP matches from hr_directory.
 enabled: true
+
+tags:
+  - enrichment
+  - hr
+  - esql
+
+version: "1"
+
+inputs:
+  - name: logs_query
+    type: string
+    required: true
+    description: >
+      A document-level ES|QL query targeting logs-* supplied by the user
+      or investigation context. Do not invent a logs-* query.
+
 triggers:
-  - type: alert
   - type: manual
-    inputs:
-      - name: mode
-        type: choice
-        options:
-          - document
-          - alert
-          - kql
-          - esql
-        default: document
-        required: true
-        description: >
-          How to select target documents. "document" = a single base event by _id;
-          "alert" = a single alert by _id in the security alerts index; "kql" = a
-          KQL/Lucene query against the target index; "esql" = an ES|QL WHERE
-          expression evaluated against the target index.
-      - name: doc_id
-        type: string
-        required: false
-        default: ""
-        description: Document _id to enrich (used when mode is "document" or "alert").
-      - name: index
-        type: string
-        required: false
-        default: "logs-*"
-        description: >
-          Target index or pattern for "document", "kql", and "esql" modes. Ignored for
-          "alert" mode, which always targets .internal.alerts-security.alerts-default-*.
-      - name: query
-        type: string
-        required: false
-        default: ""
-        description: >
-          For "kql" mode, a KQL/Lucene query string. For "esql" mode, an ES|QL WHERE
-          expression only (e.g. source.ip == "10.0.0.5" AND event.dataset == "aws.cloudtrail").
-      - name: max_docs
-        type: number
-        required: false
-        default: 100
-        description: Maximum number of documents to enrich for "kql" and "esql" modes.
+
+settings:
+  timeout: "10m"
+
 steps:
-  - name: init
-    type: data.set
-    with:
-      empty: []
-      run_mode: >-
-        {% if event.alerts %}alert_trigger{% else %}{{ inputs.mode }}{% endif %}
-      target_index: >-
-        {% if inputs.mode == "alert" %}.internal.alerts-security.alerts-default-*{% else %}{{ inputs.index }}{% endif %}
 
-  - name: alert_targets
-    type: data.map
-    if: 'steps.init.output.run_mode: "alert_trigger"'
-    items: "${{ event.alerts }}"
-    with:
-      fields:
-        _id: "${{ item._id }}"
-        _index: "${{ item._index }}"
+  # ------------------------------------------------------------
+  # Normalize the ES|QL query supplied by the user/context
+  # ------------------------------------------------------------
 
-  - name: manual_id_search
-    type: elasticsearch.request
-    if: 'steps.init.output.run_mode: "document" or steps.init.output.run_mode: "alert"'
+  - name: remove_trailing_semicolon
+    type: data.regexReplace
+    source: "${{ inputs.logs_query }}"
     with:
-      method: POST
-      path: "/{{ steps.init.output.target_index }}/_search"
-      body:
-        size: 1
-        _source: false
-        query:
-          ids:
-            values:
-              - "{{ inputs.doc_id }}"
+      pattern: ';\s*$'
+      replacement: ''
+      flags: "i"
 
-  - name: manual_kql_search
-    type: elasticsearch.request
-    if: 'steps.init.output.run_mode: "kql"'
+  # If the FROM command has no METADATA clause, add one.
+  - name: ensure_metadata_clause
+    type: data.regexReplace
+    source: "${{ steps.remove_trailing_semicolon.output }}"
     with:
-      method: POST
-      path: "/{{ steps.init.output.target_index }}/_search"
-      body:
-        size: "${{ inputs.max_docs }}"
-        _source: false
-        query:
-          query_string:
-            query: "{{ inputs.query }}"
-            default_operator: AND
+      pattern: '^(\s*FROM\s+logs-\*)(?!\s+METADATA\b)'
+      replacement: '$1 METADATA _index, _id'
+      flags: "im"
 
-  - name: manual_esql
+  # If METADATA exists but does not contain _index, add it.
+  - name: ensure_index_metadata
+    type: data.regexReplace
+    source: "${{ steps.ensure_metadata_clause.output }}"
+    with:
+      pattern: '^(\s*FROM\s+logs-\*\s+METADATA\s+)(?![^|\r\n]*\b_index\b)([^|\r\n]+)'
+      replacement: '$1_index, $2'
+      flags: "im"
+
+  # If METADATA exists but does not contain _id, add it.
+  - name: ensure_id_metadata
+    type: data.regexReplace
+    source: "${{ steps.ensure_index_metadata.output }}"
+    with:
+      pattern: '^(\s*FROM\s+logs-\*\s+METADATA\s+)(?![^|\r\n]*\b_id\b)([^|\r\n]+)'
+      replacement: '$1_id, $2'
+      flags: "im"
+
+  # ------------------------------------------------------------
+  # Execute the user/context supplied logs-* query.
+  #
+  # KEEP gives us a predictable ES|QL result:
+  #
+  #   [0] _index
+  #   [1] _id
+  #   [2] client.ip
+  #   [3] source.ip
+  #   [4] host.ip
+  # ------------------------------------------------------------
+
+  - name: query_logs
     type: elasticsearch.esql.query
-    if: 'steps.init.output.run_mode: "esql"'
     with:
-      format: json
-      query: >-
-        FROM {{ steps.init.output.target_index }} METADATA _id, _index
-        | WHERE {{ inputs.query }}
-        | KEEP _id, _index
-        | LIMIT {{ inputs.max_docs }}
+      query: |
+        {{ steps.ensure_id_metadata.output }}
+        | KEEP _index, _id, client.ip, source.ip, host.ip
 
-  - name: esql_targets
-    type: data.map
-    if: 'steps.init.output.run_mode: "esql"'
-    items: "${{ steps.manual_esql.output.values }}"
-    with:
-      fields:
-        _id: "${{ item[0] }}"
-        _index: "${{ item[1] }}"
+  # ------------------------------------------------------------
+  # Process every document returned by the provided query
+  # ------------------------------------------------------------
 
-  - name: all_targets
-    type: data.concat
-    arrays:
-      - "${{ steps.alert_targets.output | default: steps.init.output.empty }}"
-      - "${{ steps.manual_id_search.output.hits.hits | default: steps.init.output.empty }}"
-      - "${{ steps.manual_kql_search.output.hits.hits | default: steps.init.output.empty }}"
-      - "${{ steps.esql_targets.output | default: steps.init.output.empty }}"
-
-  - name: enrich_each_target
+  - name: enrich_each_log
     type: foreach
-    foreach: "${{ steps.all_targets.output }}"
-    steps:
-      - name: fetch_doc
-        type: elasticsearch.request
-        with:
-          method: GET
-          path: "/{{ foreach.item._index }}/_doc/{{ foreach.item._id }}"
+    foreach: "${{ steps.query_logs.output.values }}"
 
-      - name: extract_ips
+    max-iterations:
+      limit: 2000
+      on-limit: fail
+
+    steps:
+
+      # Save the current log document information.
+      - name: capture_log_document
         type: data.set
         with:
-          source_ips: >-
-            {{ steps.fetch_doc.output._source.source.ip | join: '","' }}
-          client_ips: >-
-            {{ steps.fetch_doc.output._source.client.ip | join: '","' }}
-          host_ips: >-
-            {{ steps.fetch_doc.output._source.host.ip | join: '","' }}
+          log_index: "{{ foreach.item[0] }}"
+          log_id: "{{ foreach.item[1] }}"
+          client_ip: "{{ foreach.item[2] | default: '' }}"
+          source_ip: "{{ foreach.item[3] | default: '' }}"
+          host_ip: "{{ foreach.item[4] | default: '' }}"
 
-      - name: hr_for_source
+      # --------------------------------------------------------
+      # Query HR directory.
+      #
+      # Convert IP_Address from string/keyword -> ip.
+      #
+      # Match priority:
+      #   1. client.ip
+      #   2. source.ip
+      #   3. host.ip
+      #
+      # The priority only matters if a single log event happens
+      # to contain multiple IPs belonging to different HR rows.
+      # --------------------------------------------------------
+
+      - name: lookup_hr
         type: elasticsearch.esql.query
         with:
-          format: json
-          query: >-
+          query: |
             FROM hr_directory
-            | WHERE IP_Address IN ("{{ steps.extract_ips.output.source_ips }}")
-            | KEEP First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+            | EVAL hr_ip = TO_IP(IP_Address)
+            | EVAL match_rank = CASE(
+                hr_ip == TO_IP("{{ variables.client_ip }}"), 1,
+                hr_ip == TO_IP("{{ variables.source_ip }}"), 2,
+                hr_ip == TO_IP("{{ variables.host_ip }}"), 3,
+                99
+              )
+            | WHERE match_rank < 99
+            | SORT match_rank ASC
+            | KEEP Department, `Sub-Department`, `Start_Date`, `First_Name`, `Last_Name`
             | LIMIT 1
 
-      - name: update_source_fields
-        type: elasticsearch.request
-        with:
-          method: POST
-          path: "/{{ foreach.item._index }}/_update_by_query"
-          params:
-            refresh: "true"
-            conflicts: proceed
-          body:
-            query:
-              ids:
-                values:
-                  - "{{ foreach.item._id }}"
-            script:
-              lang: painless
-              params:
-                First_Name: "{{ steps.hr_for_source.output.values[0][0] }}"
-                Last_Name: "{{ steps.hr_for_source.output.values[0][1] }}"
-                Department: "{{ steps.hr_for_source.output.values[0][2] }}"
-                Sub_Department: "{{ steps.hr_for_source.output.values[0][3] }}"
-                Start_Date: "{{ steps.hr_for_source.output.values[0][4] }}"
-              source: >-
-                if (params.First_Name == null || params.First_Name == '') { ctx.op = 'noop'; }
-                else {
-                  if (ctx._source.source == null) { ctx._source.source = [:]; }
-                  ctx._source.source.First_Name = params.First_Name;
-                  ctx._source.source.Last_Name = params.Last_Name;
-                  ctx._source.source.Department = params.Department;
-                  ctx._source.source['Sub-Department'] = params.Sub_Department;
-                  ctx._source.source.Start_Date = params.Start_Date;
-                }
+      # --------------------------------------------------------
+      # If lookup_hr returns no rows, this foreach performs
+      # zero iterations and the original document is untouched.
+      #
+      # If an HR match exists, update that exact logs-* document.
+      # --------------------------------------------------------
 
-      - name: hr_for_client
-        type: elasticsearch.esql.query
-        with:
-          format: json
-          query: >-
-            FROM hr_directory
-            | WHERE IP_Address IN ("{{ steps.extract_ips.output.client_ips }}")
-            | KEEP First_Name, Last_Name, Department, `Sub-Department`, Start_Date
-            | LIMIT 1
+      - name: update_from_hr_match
+        type: foreach
+        foreach: "${{ steps.lookup_hr.output.values }}"
 
-      - name: update_client_fields
-        type: elasticsearch.request
-        with:
-          method: POST
-          path: "/{{ foreach.item._index }}/_update_by_query"
-          params:
-            refresh: "true"
-            conflicts: proceed
-          body:
-            query:
-              ids:
-                values:
-                  - "{{ foreach.item._id }}"
-            script:
-              lang: painless
-              params:
-                First_Name: "{{ steps.hr_for_client.output.values[0][0] }}"
-                Last_Name: "{{ steps.hr_for_client.output.values[0][1] }}"
-                Department: "{{ steps.hr_for_client.output.values[0][2] }}"
-                Sub_Department: "{{ steps.hr_for_client.output.values[0][3] }}"
-                Start_Date: "{{ steps.hr_for_client.output.values[0][4] }}"
-              source: >-
-                if (params.First_Name == null || params.First_Name == '') { ctx.op = 'noop'; }
-                else {
-                  if (ctx._source.client == null) { ctx._source.client = [:]; }
-                  ctx._source.client.First_Name = params.First_Name;
-                  ctx._source.client.Last_Name = params.Last_Name;
-                  ctx._source.client.Department = params.Department;
-                  ctx._source.client['Sub-Department'] = params.Sub_Department;
-                  ctx._source.client.Start_Date = params.Start_Date;
-                }
+        max-iterations:
+          limit: 1
+          on-limit: fail
 
-      - name: hr_for_host
-        type: elasticsearch.esql.query
-        with:
-          format: json
-          query: >-
-            FROM hr_directory
-            | WHERE IP_Address IN ("{{ steps.extract_ips.output.host_ips }}")
-            | KEEP First_Name, Last_Name, Department, `Sub-Department`, Start_Date
-            | LIMIT 1
+        steps:
 
-      - name: update_host_fields
-        type: elasticsearch.request
-        with:
-          method: POST
-          path: "/{{ foreach.item._index }}/_update_by_query"
-          params:
-            refresh: "true"
-            conflicts: proceed
-          body:
-            query:
-              ids:
-                values:
-                  - "{{ foreach.item._id }}"
-            script:
-              lang: painless
-              params:
-                First_Name: "{{ steps.hr_for_host.output.values[0][0] }}"
-                Last_Name: "{{ steps.hr_for_host.output.values[0][1] }}"
-                Department: "{{ steps.hr_for_host.output.values[0][2] }}"
-                Sub_Department: "{{ steps.hr_for_host.output.values[0][3] }}"
-                Start_Date: "{{ steps.hr_for_host.output.values[0][4] }}"
-              source: >-
-                if (params.First_Name == null || params.First_Name == '') { ctx.op = 'noop'; }
-                else {
-                  if (ctx._source.host == null) { ctx._source.host = [:]; }
-                  ctx._source.host.First_Name = params.First_Name;
-                  ctx._source.host.Last_Name = params.Last_Name;
-                  ctx._source.host.Department = params.Department;
-                  ctx._source.host['Sub-Department'] = params.Sub_Department;
-                  ctx._source.host.Start_Date = params.Start_Date;
-                }
-
-  - name: done
-    type: console
-    with:
-      message: >-
-        HR enrichment completed for {{ steps.all_targets.output | size }} target document(s)
-        in mode "{{ steps.init.output.run_mode }}".
+          - name: enrich_log_document
+            type: elasticsearch.update
+            with:
+              index: "{{ variables.log_index }}"
+              id: "{{ variables.log_id }}"
+              doc:
+                "enriched.Department": "{{ foreach.item[0] }}"
+                "enriched.Sub-Department": "{{ foreach.item[1] }}"
+                "enriched.StartDate": "{{ foreach.item[2] }}"
+                "enriched.First_Name": "{{ foreach.item[3] }}"
+                "enriched.Last_Name": "{{ foreach.item[4] }}"
