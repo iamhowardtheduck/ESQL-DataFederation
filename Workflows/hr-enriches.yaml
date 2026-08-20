@@ -1,0 +1,77 @@
+version: "1"
+name: Enrich logs from HR directory
+description: Mutates logs-* documents by setting hr.* fields from hr_directory rows when source.ip, client.ip, or host.ip matches IP_Address within the requested time range. No LOOKUP JOIN is used.
+enabled: true
+triggers:
+  - type: manual
+    inputs:
+      properties:
+        from:
+          type: string
+          description: Start of @timestamp range for logs-* documents to update
+          default: now-24h
+        to:
+          type: string
+          description: End of @timestamp range for logs-* documents to update
+          default: now
+steps:
+  - name: read_hr_directory
+    type: elasticsearch.esql.query
+    with:
+      query: |
+        FROM hr_directory
+        | WHERE IP_Address IS NOT NULL
+        | KEEP IP_Address, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+        | LIMIT 10000
+      format: json
+  - name: update_logs_for_each_hr_row
+    type: foreach
+    foreach: "{{ steps.read_hr_directory.output.values | json }}"
+    steps:
+      - name: set_hr_fields_on_matching_logs
+        type: elasticsearch.request
+        with:
+          method: POST
+          path: /logs-*/_update_by_query
+          body:
+            script:
+              lang: painless
+              source: |
+                ctx._source.hr = [
+                  'ip_address': params.ip_address,
+                  'first_name': params.first_name,
+                  'last_name': params.last_name,
+                  'full_name': params.full_name,
+                  'department': params.department,
+                  'sub_department': params.sub_department,
+                  'start_date': params.start_date,
+                  'enriched_at': params.enriched_at
+                ];
+              params:
+                ip_address: "{{ foreach.item[0] }}"
+                first_name: "{{ foreach.item[1] }}"
+                last_name: "{{ foreach.item[2] }}"
+                full_name: "{{ foreach.item[1] }} {{ foreach.item[2] }}"
+                department: "{{ foreach.item[3] }}"
+                sub_department: "{{ foreach.item[4] }}"
+                start_date: "{{ foreach.item[5] }}"
+                enriched_at: "{{ now }}"
+            query:
+              bool:
+                filter:
+                  - range:
+                      "@timestamp":
+                        gte: "{{ inputs.from }}"
+                        lte: "{{ inputs.to }}"
+                  - bool:
+                      should:
+                        - term:
+                            source.ip: "{{ foreach.item[0] }}"
+                        - term:
+                            client.ip: "{{ foreach.item[0] }}"
+                        - term:
+                            host.ip: "{{ foreach.item[0] }}"
+                      minimum_should_match: 1
+          params:
+            conflicts: proceed
+            refresh: true
