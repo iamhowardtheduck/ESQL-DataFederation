@@ -1,0 +1,166 @@
+name: hr--enrich-alerts-by-ip
+description: >
+  Detection rule action: enrich the firing security alert documents
+  (.internal.alerts-security.alerts-default-*) with HR Department,
+  Sub-Department, Start-Date, and name, matched from hr_directory by
+  client.ip / source.ip / host.ip on the alert itself.
+enabled: true
+
+tags:
+  - enrichment
+  - hr
+  - esql
+  - alerts
+
+version: "1"
+
+inputs:
+  - name: alert_ids
+    type: string
+    required: false
+    description: >
+      Optional comma-separated list of alert _id values
+      (kibana.alert.uuid) for manual runs / testing. When the workflow
+      fires as a detection rule action, the alert IDs come from
+      event.alerts automatically and this input is ignored.
+
+triggers:
+  - type: alert
+  - type: manual
+
+settings:
+  timeout: "10m"
+
+steps:
+
+  # ------------------------------------------------------------
+  # Resolve the alert _id list:
+  #   1. alert_ids input (manual runs / testing), comma-separated
+  #   2. event.alerts (real detection-rule-action runs)
+  # Produces a quoted, comma-separated list ready for _id IN (...).
+  # ------------------------------------------------------------
+
+  - name: resolve_alert_ids
+    type: data.set
+    with:
+      id_list: >-
+        {% if inputs.alert_ids and inputs.alert_ids != "" %}{% assign parts = inputs.alert_ids | split: "," %}{% for p in parts %}"{{ p | strip }}"{% unless forloop.last %}, {% endunless %}{% endfor %}{% elsif event.alerts %}{% for a in event.alerts %}"{{ a._id }}"{% unless forloop.last %}, {% endunless %}{% endfor %}{% endif %}
+
+  # ------------------------------------------------------------
+  # Pull the firing alert documents. Security alerts carry the
+  # source event's ECS fields, so client.ip / source.ip / host.ip
+  # are readable directly off the alert doc. METADATA _index gives
+  # the concrete .internal.alerts-* backing index for each alert,
+  # so the update targets exactly one index, never a wildcard.
+  #
+  #   [0] _index   (.internal.alerts-security.alerts-default-NNNNNN)
+  #   [1] _id      (kibana.alert.uuid)
+  #   [2] client.ip
+  #   [3] source.ip
+  #   [4] host.ip
+  # ------------------------------------------------------------
+
+  - name: query_alerts
+    type: elasticsearch.esql.query
+    with:
+      query: |
+        FROM .alerts-security.alerts-default METADATA _index, _id
+        | WHERE _id IN ({{ steps.resolve_alert_ids.output.id_list }})
+        | KEEP _index, _id, client.ip, source.ip, host.ip
+
+  # ------------------------------------------------------------
+  # Process every firing alert
+  # ------------------------------------------------------------
+
+  - name: enrich_each_alert
+    type: foreach
+    foreach: "${{ steps.query_alerts.output.values }}"
+
+    max-iterations:
+      limit: 100
+      on-limit: fail
+
+    steps:
+
+      # Save the current alert document information.
+      - name: capture_alert_document
+        type: data.set
+        with:
+          alert_index: "{{ foreach.item[0] }}"
+          alert_id: "{{ foreach.item[1] }}"
+          client_ip: "{{ foreach.item[2] | default: '' }}"
+          source_ip: "{{ foreach.item[3] | default: '' }}"
+          host_ip: "{{ foreach.item[4] | default: '' }}"
+
+      # --------------------------------------------------------
+      # Query HR directory. Match priority:
+      #   1. client.ip  2. source.ip  3. host.ip
+      # match_rank is enforced: an alert with no IP match returns
+      # zero rows and is left untouched.
+      # --------------------------------------------------------
+
+      - name: lookup_hr
+        type: elasticsearch.esql.query
+        with:
+          query: |
+            FROM hr_directory
+            | EVAL hr_ip = TO_IP(IP_Address)
+            | EVAL match_rank = CASE(
+                hr_ip == TO_IP("{{ variables.client_ip }}"), 1,
+                hr_ip == TO_IP("{{ variables.source_ip }}"), 2,
+                hr_ip == TO_IP("{{ variables.host_ip }}"), 3
+              )
+            | WHERE match_rank IS NOT NULL
+            | SORT match_rank ASC
+            | KEEP Department, `Sub-Department`, `Start_Date`, `First_Name`, `Last_Name`
+            | LIMIT 1
+
+      # --------------------------------------------------------
+      # If an HR match exists, enrich the alert document itself
+      # via update_by_query against its exact backing index,
+      # scoped to its exact _id. conflicts=proceed tolerates the
+      # alert framework touching the doc concurrently (status
+      # changes, flapping updates).
+      # --------------------------------------------------------
+
+      - name: update_from_hr_match
+        type: foreach
+        foreach: "${{ steps.lookup_hr.output.values }}"
+
+        max-iterations:
+          limit: 1
+          on-limit: fail
+
+        steps:
+
+          # elasticsearch.request is a static connector (always in
+          # the validator schema) and the executor forwards it
+          # verbatim via esClient.transport.request -- used here
+          # because elasticsearch.update_by_query is not registered
+          # as a step type in this build's validator.
+          - name: enrich_alert_document
+            type: elasticsearch.request
+            with:
+              method: POST
+              path: "/{{ variables.alert_index }}/_update_by_query?conflicts=proceed&refresh=true"
+              body:
+                query:
+                  ids:
+                    values:
+                      - "{{ variables.alert_id }}"
+                script:
+                  lang: painless
+                  params:
+                    department: "{{ foreach.item[0] }}"
+                    sub_department: "{{ foreach.item[1] }}"
+                    start_date: "{{ foreach.item[2] }}"
+                    first_name: "{{ foreach.item[3] }}"
+                    last_name: "{{ foreach.item[4] }}"
+                  source: >-
+                    ctx._source.enriched = [
+                      'Department': params.department,
+                      'Sub-Department': params.sub_department,
+                      'StartDate': params.start_date,
+                      'First_Name': params.first_name,
+                      'Last_Name': params.last_name
+                    ];
