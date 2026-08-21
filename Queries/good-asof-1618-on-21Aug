@@ -1,0 +1,32 @@
+FROM
+          (
+            FROM logs-* METADATA _id, _index
+            | WHERE client.ip IS NOT NULL 
+            | KEEP client.ip, event.module, _id, _index
+          ),
+          (
+            FROM hr_directory
+            | WHERE IP_Address IS NOT NULL
+            | EVAL client.ip = TO_IP(IP_Address)
+            | KEEP client.ip, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+          )
+        | EVAL data_type = CASE(
+            event.module IS NOT NULL, "Dataset",
+            _id IS NOT NULL, "Doc_ID",
+            _index IS NOT NULL, "Index",
+            Department IS NOT NULL, "HR",
+            "Other"
+          )
+        | STATS
+            log_events = COUNT(*) WHERE data_type IS NOT NULL,
+            hr_matches = COUNT(*) WHERE data_type == "HR",
+            First_Name = VALUES(First_Name),
+            Last_Name = VALUES(Last_Name),
+            Department = VALUES(Department),
+            `Sub-Department` = VALUES(`Sub-Department`),
+            Start_Date = VALUES(Start_Date),
+            Dataset = VALUES(event.module),
+            Doc_ID = VALUES(_id),
+            Index = VALUES(_index)
+          BY client.ip
+        | WHERE log_events > 0 AND hr_matches > 0
