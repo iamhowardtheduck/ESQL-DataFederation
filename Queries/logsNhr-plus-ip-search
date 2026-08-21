@@ -1,0 +1,31 @@
+FROM
+  (
+    FROM logs-*
+    | WHERE client.ip IS NOT NULL 
+    | KEEP client.ip, event.module
+  ),
+  (
+    FROM hr_directory
+    | WHERE IP_Address IS NOT NULL
+    | EVAL client.ip = TO_IP(IP_Address)
+    | KEEP client.ip, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+  )
+| EVAL data_type = CASE(
+    event.module == "network_traffic", "Netflow",
+    event.module == "proxysg", "Proxy",
+    event.module == "email", "Email",
+    event.module == "ti_abusech", "Threat-Intel",
+    event.module == "system", "Windows",
+    Department IS NOT NULL, "HR",
+    "Other"
+  )
+| STATS
+    log_events = COUNT(*) WHERE data_type == "Netflow" OR data_type == "Proxy" OR data_type == "Email" OR data_type == "Windows" OR data_type == "Threat-Intel",
+    hr_matches = COUNT(*) WHERE data_type == "HR",
+    First_Name = VALUES(First_Name),
+    Last_Name = VALUES(Last_Name),
+    Department = VALUES(Department), 
+    `Sub-Department` = VALUES(`Sub-Department`),
+    Start_Date = VALUES(Start_Date)
+  BY client.ip
+| WHERE log_events > 0 AND hr_matches > 0 AND client.ip == "10.31.100.12"
