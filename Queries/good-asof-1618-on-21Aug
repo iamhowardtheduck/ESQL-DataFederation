@@ -18,7 +18,7 @@ FROM
             "Other"
           )
         | STATS
-            log_events = COUNT(*) WHERE data_type IS NOT NULL,
+            log_events = COUNT(*) WHERE data_type == "Dataset",
             hr_matches = COUNT(*) WHERE data_type == "HR",
             First_Name = VALUES(First_Name),
             Last_Name = VALUES(Last_Name),
