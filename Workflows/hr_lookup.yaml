@@ -16,9 +16,9 @@ steps:
       query: |
         FROM
           (
-            FROM logs-*
+            FROM logs-* METADATA _id, _index
             | WHERE client.ip == "{{ inputs.ip_address }}"
-            | KEEP client.ip, event.module
+            | KEEP client.ip, event.module, _id, _index
           ),
           (
             FROM hr_directory
@@ -42,6 +42,8 @@ steps:
             Last_Name = VALUES(Last_Name),
             Department = VALUES(Department),
             `Sub-Department` = VALUES(`Sub-Department`),
-            Start_Date = VALUES(Start_Date)
+            Start_Date = VALUES(Start_Date),
+            Doc_ID = VALUES(_id),
+            Index = VALUES(_index)
           BY client.ip
         | WHERE log_events > 0 AND hr_matches > 0
