@@ -1,0 +1,111 @@
+name: "HR LOOKUP"      # the name of our workflow
+
+triggers:
+  - type: manual     # a manual initiation of the automation
+    inputs:
+      - name: ip_address    # will set the value ip_address
+        type: string                  # as a string
+        description: "IP address to look up (e.g. 192.168.1.1)"
+        required: true             # must exist or the workflow will fail
+
+steps:
+  - name: ip_lookup     # the name of this step
+    type: elasticsearch.esql.query    # the type of action it will take, an ES|QL query
+    with:
+      format: "json"  # formatted as json
+      query: |
+
+        FROM
+          (
+            FROM logs-* METADATA _id, _index
+            // # an ES|QL sub-query to also include the _id and _index of the documents
+            | WHERE client.ip == "{{ inputs.ip_address }}" OR host.ip == "{{ inputs.ip_address }}" OR destination.ip == "{{ inputs.ip_address }}" OR source.ip == "{{ inputs.ip_address }}"
+            // # looking up the manual input of the ip_address across client, host, destination, or source ip fields
+            | KEEP client.ip, host.ip, destination.ip, source.ip, event.module, _id, _index
+            // # keep the fields used plus the event.module field
+          ),
+          (
+            FROM hr_directory
+            // # an ES|QL sub-query to our S3 compatible data store
+            | WHERE IP_Address == "{{ inputs.ip_address }}"
+            // # using that same manual input
+            | EVAL client.ip = TO_IP(IP_Address)
+            // # converting the value to an IP as this dataset has it mapped as keyword
+            | KEEP client.ip, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+            // # keep all of our HR data of interest
+          )
+        | EVAL data_type = CASE(
+          // #  an ES|QL case state to classify document, note if want to limit the scope we could apply an == condition instead of IS NOT NULL
+            event.module IS NOT NULL, "Dataset",
+            // # so we know what data set it came from
+            _id IS NOT NULL, "Doc_ID",
+            // # so we know the exact document that matched
+            _index IS NOT NULL, "Index",
+            // # so we know the precise index that matched, good in case of fast rollovers
+            Department IS NOT NULL, "HR",
+            // # to ensure we get our HR directory data
+            "Other"
+            // # just in case something is out there
+          )
+        | STATS
+            log_events = COUNT(*) WHERE _id IS NOT NULL,
+            // # count the number of logs-* events found
+            hr_matches = COUNT(*) WHERE data_type == "HR",
+            // # count the number of matching HR document, should always be 1
+            First_Name = VALUES(First_Name),
+            // #  display all First_Name values found, should always be 1, called as foreach.item[2]
+            Last_Name = VALUES(Last_Name),
+            // #  display all Last_Name values found, should always be 1, called as foreach.item[3]
+            Department = VALUES(Department),
+            // #  display Department values found, should always be 1, called as foreach.item[4]
+            `Sub-Department` = VALUES(`Sub-Department`),
+            // #  display Sub-Department values found, should always be 1, called as foreach.item[5]
+            Start_Date = VALUES(Start_Date),
+            // #  display Start_Date values found, should always be 1, called as foreach.item[6]
+            Dataset = VALUES(event.module),
+            // #  display dataset values found, may be more than 1
+            Doc_ID = VALUES(_id),
+            // #  display _id values found, may be more than 1
+            Index = VALUES(_index)
+            // #  display _index values found, may be more than 1
+        | WHERE log_events > 0 AND hr_matches > 0
+          // #  Only show events that have hits and nothing more
+
+  - name: enrich_matched_docs
+    # iterate each result row from the ip_lookup STATS table
+    type: foreach
+    foreach: "{{ steps.ip_lookup.output.values }}"  # access values from ip_lookup step
+    # plain {{ }} template - this engine requires the expression to start
+    # with {{ and end with }}, and evaluates it to the real array
+    steps:
+      - name: update_docs
+        type: elasticsearch.request  # API call to itself
+        with:
+          method: "POST"  
+          path: "/logs-*/_update_by_query?conflicts=proceed&refresh=true"  
+          # path to update a document/event
+          body:
+            query:
+              ids:
+                values: "${{ foreach.item[8] }}"  
+                # using each _id found from the previous step
+                # Doc_ID column - keep ${{ }} here; 'with' params use the
+                # full templating engine where ${{ }} preserves the array
+            script:
+              lang: "painless"   
+              source: |
+                if (ctx._source.enriched == null) {
+                  ctx._source.enriched = new HashMap();
+                } 
+                // if enriched top level field is null, then add the following
+                ctx._source.enriched.First_Name     = params.first_name;  
+                ctx._source.enriched.Last_Name      = params.last_name;   
+                ctx._source.enriched.Department     = params.department;  
+                ctx._source.enriched.Sub_Department = params.sub_department;  
+                ctx._source.enriched.Start_Date     = params.start_date;  
+              params:
+                first_name: "${{ foreach.item[2] }}"      
+                last_name: "${{ foreach.item[3] }}"       
+                department: "${{ foreach.item[4] }}"      
+                sub_department: "${{ foreach.item[5] }}"  
+                start_date: "${{ foreach.item[6] }}"      
