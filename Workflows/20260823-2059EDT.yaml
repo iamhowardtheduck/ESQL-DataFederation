@@ -1,0 +1,144 @@
+name: "HR LOOKUP"      # the name of our workflow
+
+triggers:
+  - type: manual     # a manual initiation of the automation
+    inputs:
+      - name: ip_address    # will set the value ip_address
+        type: string
+        description: "IP address to look up (e.g. 192.168.1.1). Optional if doc_id is provided."
+        required: false     # optional - doc_id may be used instead
+      - name: doc_id        # will set the value doc_id
+        type: string
+        description: "A logs-* document _id. Its client/host/destination/source IPs will all be looked up."
+        required: false     # optional - ip_address may be used instead
+
+steps:
+  - name: get_doc_ips
+    # always runs; with no doc_id it matches nothing and yields zero rows,
+    # which render as empty strings downstream - no if: step required
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: |
+        FROM logs-* METADATA _id
+        | WHERE _id == "{{ inputs.doc_id }}"
+        // # find the chosen document by its _id ("" in manual mode matches nothing)
+        | EVAL client_ip = MV_FIRST(TO_STRING(client.ip)),
+               host_ip = MV_FIRST(TO_STRING(host.ip)),
+               destination_ip = MV_FIRST(TO_STRING(destination.ip)),
+               source_ip = MV_FIRST(TO_STRING(source.ip))
+        // # MV_FIRST guards against multivalued IP fields, which Liquid would mangle
+        | KEEP client_ip, host_ip, destination_ip, source_ip
+        | LIMIT 1
+
+  - name: ip_lookup     # the name of this step
+    type: elasticsearch.esql.query    # the type of action it will take, an ES|QL query
+    with:
+      format: "json"  # formatted as json
+      query: |
+
+        FROM
+          (
+            FROM logs-* METADATA _id, _index
+            // # an ES|QL sub-query to also include the _id and _index of the documents
+            | WHERE TO_STRING(client.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}")
+                OR TO_STRING(host.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}")
+                OR TO_STRING(destination.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}")
+                OR TO_STRING(source.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}")
+            // # the candidate set: manual input + the chosen doc's four IPs
+            // # unused slots render "" and never match; TO_STRING keeps the
+            // # comparison string-typed so "" doesn't fail IP literal casting
+            | EVAL matched_ip = CASE(
+                TO_STRING(client.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}"), TO_STRING(client.ip),
+                TO_STRING(host.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}"), TO_STRING(host.ip),
+                TO_STRING(destination.ip) IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}"), TO_STRING(destination.ip),
+                TO_STRING(source.ip))
+            // # which IP this row matched on - this becomes the join key to the HR row
+            | KEEP matched_ip, event.module, _id, _index
+            // # keep the join key plus the metadata fields of interest
+          ),
+          (
+            FROM hr_directory
+            // # an ES|QL sub-query to our S3 compatible data store
+            | WHERE IP_Address IN ("{{ inputs.ip_address }}", "{{ steps.get_doc_ips.output.values[0][0] }}", "{{ steps.get_doc_ips.output.values[0][1] }}", "{{ steps.get_doc_ips.output.values[0][2] }}", "{{ steps.get_doc_ips.output.values[0][3] }}")
+            // # IP_Address is mapped keyword, so it compares as a string natively
+            | EVAL matched_ip = IP_Address
+            // # same join key on the HR side
+            | KEEP matched_ip, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+            // # keep all of our HR data of interest
+          )
+        | EVAL data_type = CASE(
+          // # an ES|QL case statement to classify each document
+            event.module IS NOT NULL, "Dataset",
+            // # so we know what data set it came from
+            _id IS NOT NULL, "Doc_ID",
+            // # so we know the exact document that matched
+            _index IS NOT NULL, "Index",
+            // # so we know the precise index that matched, good in case of fast rollovers
+            Department IS NOT NULL, "HR",
+            // # to ensure we get our HR directory data
+            "Other"
+            // # just in case something is out there
+          )
+        | STATS
+            log_events = COUNT(*) WHERE _id IS NOT NULL,
+            // # count only logs-* docs (the HR row has no _id)
+            hr_matches = COUNT(*) WHERE data_type == "HR",
+            // # count the number of matching HR documents, should always be 1 per IP
+            First_Name = VALUES(First_Name),
+            // # display all First_Name values found, should always be 1
+            Last_Name = VALUES(Last_Name),
+            // # display all Last_Name values found, should always be 1
+            Department = VALUES(Department),
+            // # display Department values found, should always be 1
+            `Sub-Department` = VALUES(`Sub-Department`),
+            // # display Sub-Department values found, should always be 1
+            Start_Date = VALUES(Start_Date),
+            // # display Start_Date values found, should always be 1
+            Dataset = VALUES(event.module),
+            // # display dataset values found, may be more than 1
+            Doc_ID = VALUES(_id),
+            // # display _id values found, may be more than 1
+            Index = VALUES(_index)
+            // # display _index values found, may be more than 1
+          BY matched_ip
+          // # one row per matched IP = one row per employee; matched_ip appends
+          // # as column 10, so columns 0-9 keep their positions for the foreach
+        | WHERE log_events > 0 AND hr_matches > 0
+          // # Only show IPs that have both log hits and an HR match
+
+  - name: enrich_matched_docs
+    # iterate each result row from the ip_lookup STATS table
+    type: foreach
+    foreach: "{{ steps.ip_lookup.output.values }}"  # access values from ip_lookup step
+    # plain {{ }} template - this engine requires the expression to start
+    # with {{ and end with }}, and evaluates it to the real array
+    steps:
+      - name: update_docs
+        type: elasticsearch.request  # API call to itself
+        with:
+          method: "POST"
+          path: "/logs-*/_update_by_query?conflicts=proceed&refresh=true"  # path to update a document/event
+          body:
+            query:
+              ids:
+                values: "${{ foreach.item[8] }}"  # using each _id found from the previous step
+                # Doc_ID column - keep ${{ }} here; 'with' params use the
+                # full templating engine where ${{ }} preserves the array
+            script:
+              lang: "painless"
+              source: |
+                if (ctx._source.enriched == null) {
+                  ctx._source.enriched = new HashMap();
+                } // create the enriched object first if it doesn't exist yet
+                ctx._source.enriched.First_Name     = params.first_name;  // first name from above
+                ctx._source.enriched.Last_Name      = params.last_name;   // last name from above
+                ctx._source.enriched.Department     = params.department;  // department name from above
+                ctx._source.enriched.Sub_Department = params.sub_department;  // sub-department from above
+                ctx._source.enriched.Start_Date     = params.start_date;  // start date from above
+              params:
+                first_name: "${{ foreach.item[2] }}"      # First_Name
+                last_name: "${{ foreach.item[3] }}"       # Last_Name
+                department: "${{ foreach.item[4] }}"      # Department
+                sub_department: "${{ foreach.item[5] }}"  # Sub-Department
+                start_date: "${{ foreach.item[6] }}"      # Start_Date
