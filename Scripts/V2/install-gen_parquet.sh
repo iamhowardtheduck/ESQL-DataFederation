@@ -20,7 +20,7 @@
 #
 set -Eeuo pipefail
 
-SCRIPTS_DIR="/home/elastic/ESQL-DataFederation/Scripts"
+SCRIPTS_DIR="/home/elastic/ESQL-DataFederation/Scripts/V2"
 MC_ALIAS="local"
 MC_URL="http://localhost:9000"
 MC_USER="minioadmin"
