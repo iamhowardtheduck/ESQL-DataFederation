@@ -1,0 +1,202 @@
+name: "HR LOOKUP - ENRICH TO NEW INDEX"
+
+triggers:
+  - type: manual
+    inputs:
+      type: object
+      properties:
+        ip_addresses:
+          type: string
+          description: "One or more IPs and/or CIDR blocks, comma-separated (e.g. 10.49.99.99,10.49.0.0/24). Bare IPs are treated as /32. Each matching employee gets full-trail enrichment."
+          default: ""
+        doc_ids:
+          type: string
+          description: "One or more log/alert _ids, comma-separated. Each doc (or an alert's source event) gets single-doc enrichment."
+          default: ""
+        event:
+          type: object
+          description: "Populated automatically by document/alert selection UIs."
+          properties:
+            documents:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  index:
+                    type: string
+            alertIds:
+              type: array
+              items:
+                type: object
+                properties:
+                  _id:
+                    type: string
+                  _index:
+                    type: string
+      required: []
+
+steps:
+  - name: get_doc_ips
+    # batch doc resolver: all selected/pasted docs -> ONE row of multivalue
+    # candidate columns (VALUES aggregates across docs, ignores nulls)
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: |
+        FROM logs-*,.alerts* METADATA _id
+        | WHERE _id IN ("{{ inputs.doc_ids | replace: ' ', '' | split: ',' | join: '","' }}")
+             OR _id IN ("{{ event.documents | map: 'id' | join: '","' }}")
+             OR _id IN ("{{ inputs.event.alertIds | map: '_id' | join: '","' }}")
+        // # comma-separated inputs (spaces stripped) and multi-selections render
+        // # as "id1","id2",... ; absent sources render "" which matches nothing
+        | EVAL target_id = CASE(
+            kibana.alert.ancestors.id IS NOT NULL, TO_STRING(MV_FIRST(kibana.alert.ancestors.id)),
+            TO_STRING(_id))
+        // # alerts resolve to their SOURCE event (alert docs stay pristine);
+        // # log docs resolve to themselves
+        | STATS client_ips = VALUES(TO_STRING(MV_FIRST(client.ip))),
+                host_ips = VALUES(TO_STRING(MV_FIRST(host.ip))),
+                destination_ips = VALUES(TO_STRING(MV_FIRST(destination.ip))),
+                source_ips = VALUES(TO_STRING(MV_FIRST(source.ip))),
+                target_ids = VALUES(target_id)
+        // # MV_FIRST inside TO_STRING: scalar fns null out on multivalued fields.
+        // # one row out; columns: [0]=client_ips [1]=host_ips [2]=destination_ips
+        // # [3]=source_ips [4]=target_ids
+
+  - name: ip_lookup
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: |
+        FROM
+          (
+            FROM logs-* METADATA _id, _index
+            | WHERE CIDR_MATCH(client.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}")
+                OR TO_STRING(client.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR CIDR_MATCH(host.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}")
+                OR TO_STRING(host.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR CIDR_MATCH(destination.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}")
+                OR TO_STRING(destination.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR CIDR_MATCH(source.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}")
+                OR TO_STRING(source.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+            // # typed input matches via CIDR_MATCH (bare IPs act as /32); the
+            // # empty-input default renders a valid-but-unmatchable /32 so ES|QL
+            // # verification never sees "". doc-derived candidates stay exact
+            // # string matches against all four field-family lists
+            | EVAL matched_ip = CASE(
+                CIDR_MATCH(client.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}") OR TO_STRING(client.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(client.ip),
+                CIDR_MATCH(host.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}") OR TO_STRING(host.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(host.ip),
+                CIDR_MATCH(destination.ip, "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}") OR TO_STRING(destination.ip) IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(destination.ip),
+                TO_STRING(source.ip))
+            // # matched_ip = the concrete per-doc IP that hit - the join key
+            | EVAL is_selected = _id IN ("{{ steps.get_doc_ips.output.values[0][4] | join: '","' }}")
+            // # tag the docs the user actually picked (or alert source events)
+            | KEEP matched_ip, event.module, _id, _index, is_selected
+          ),
+          (
+            FROM hr_directory
+            | WHERE CIDR_MATCH(TO_IP(IP_Address), "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}")
+                OR IP_Address IN ("{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+            // # IP_Address is keyword: cast to IP for CIDR, string-compare for docs.
+            // # a CIDR block pulls EVERY HR employee inside it into the run
+            | EVAL matched_ip = IP_Address
+            | KEEP matched_ip, First_Name, Last_Name, Department, Team, Start_Date, Employee_ID
+          )
+        | EVAL data_type = CASE(
+            event.module IS NOT NULL, "Dataset",
+            _id IS NOT NULL, "Doc_ID",
+            _index IS NOT NULL, "Index",
+            Department IS NOT NULL, "HR",
+            "Other"
+          )
+        | STATS
+            log_events = COUNT(*) WHERE _id IS NOT NULL,
+            hr_matches = COUNT(*) WHERE data_type == "HR",
+            First_Name = VALUES(First_Name),
+            Last_Name = VALUES(Last_Name),
+            Department = VALUES(Department),
+            Team = VALUES(Team),
+            // # column 5 (Team replaces the retired Sub-Department field)
+            Start_Date = VALUES(Start_Date),
+            Dataset = VALUES(event.module),
+            Doc_ID = VALUES(_id),
+            Index = VALUES(_index),
+            Selected_IDs = COALESCE(VALUES(CASE(is_selected, TO_STRING(_id), NULL)), "_none_"),
+            // # column 10: THIS employee's selected docs only - keeps multi-doc
+            // # batches from cross-stamping; "_none_" sentinel keeps the ids
+            // # query non-empty and parse-valid in IP/CIDR-only mode
+            Employee_ID = VALUES(TO_STRING(Employee_ID))
+            // # column 11 - TO_STRING normalizes numeric-mapped IDs
+          BY matched_ip
+          // # column 12: one row per concrete employee IP
+        | WHERE log_events > 0 AND hr_matches > 0
+        | EVAL Trail_IP = CASE(
+            CIDR_MATCH(TO_IP(matched_ip), "{{ inputs.ip_addresses | replace: ' ', '' | split: ',' | join: '","' | default: '255.255.255.255/32' }}"), matched_ip,
+            "255.255.255.255")
+        // # column 13: per-employee mode fuse - employees inside any TYPED
+        // # IP/CIDR get their real IP (full-trail fan-out); doc-selected
+        // # employees get the valid-but-unmatchable broadcast address
+
+  - name: enrich_matched_docs
+    # one iteration per matched employee
+    type: foreach
+    foreach: "{{ steps.ip_lookup.output.values }}"
+    # plain {{ }} template - this engine requires the expression to start
+    # with {{ and end with }}, and evaluates it to the real array
+    steps:
+      - name: copy_to_probation
+        type: elasticsearch.request  # API call to itself
+        with:
+          method: "POST"
+          path: "/_reindex?refresh=true&wait_for_completion=false"
+          body:
+            conflicts: "proceed"
+            # rerun-safe: same _id lands in probation again -> overwrite, idempotent
+            source:
+              index: "logs-*"
+              # probation index (underscores) doesn't match logs-*, so reindex
+              # can never read its own output - no exclusion needed
+              query:
+                bool:
+                  minimum_should_match: 1
+                  should:
+                    - ids:
+                        values: "${{ foreach.item[10] }}"
+                        # Selected_IDs (col 10): typed ${{ }} passes the per-employee
+                        # multivalue as a real array; "_none_" sentinel in
+                        # IP/CIDR-only mode is parse-valid and matches nothing
+                    - bool:
+                        minimum_should_match: 1
+                        should:
+                          - term: { "client.ip": "{{ foreach.item[13] }}" }
+                          - term: { "host.ip": "{{ foreach.item[13] }}" }
+                          - term: { "destination.ip": "{{ foreach.item[13] }}" }
+                          - term: { "source.ip": "{{ foreach.item[13] }}" }
+                        # Trail_IP (col 13): real IP for typed/CIDR-matched
+                        # employees -> full trail; broadcast for doc-selected
+                        # employees -> matches nothing
+            dest:
+              index: "logs_on_double_secret_probation"
+              # plain index (underscores dodge the logs-*-* data stream template);
+              # reindex preserves the source _id, sealing original doc integrity
+            script:
+              lang: "painless"
+              source: |
+                if (ctx._source.enriched == null) {
+                  ctx._source.enriched = new HashMap();
+                } // create the enriched object first if it doesn't exist yet
+                ctx._source.enriched.First_Name  = params.first_name;  // first name from above
+                ctx._source.enriched.Last_Name   = params.last_name;   // last name from above
+                ctx._source.enriched.Department  = params.department;  // department name from above
+                ctx._source.enriched.Team        = params.team;        // team from above
+                ctx._source.enriched.Start_Date  = params.start_date;  // start date from above
+                ctx._source.enriched.Employee_ID = params.employee_id; // employee id from above
+              params:
+                first_name: "${{ foreach.item[2] }}"    # First_Name
+                last_name: "${{ foreach.item[3] }}"     # Last_Name
+                department: "${{ foreach.item[4] }}"    # Department
+                team: "${{ foreach.item[5] }}"          # Team
+                start_date: "${{ foreach.item[6] }}"    # Start_Date
+                employee_id: "${{ foreach.item[11] }}"  # Employee_ID
