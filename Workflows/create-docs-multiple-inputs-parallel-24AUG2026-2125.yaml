@@ -1,0 +1,172 @@
+name: "HR LOOKUP"
+
+triggers:
+  - type: manual
+    inputs:
+      type: object
+      properties:
+        ip_addresses:
+          type: string
+          description: "One or more IPs, comma-separated, NO spaces (e.g. 10.1.2.3,10.4.5.6). Each gets full-trail enrichment."
+          default: ""
+        doc_ids:
+          type: string
+          description: "One or more log/alert _ids, comma-separated, NO spaces. Each doc (or alert's source event) gets single-doc enrichment."
+          default: ""
+        event:
+          type: object
+          description: "Populated automatically by document/alert selection UIs."
+          properties:
+            documents:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  index:
+                    type: string
+            alertIds:
+              type: array
+              items:
+                type: object
+                properties:
+                  _id:
+                    type: string
+                  _index:
+                    type: string
+      required: []
+
+steps:
+  - name: get_doc_ips
+    # batch doc resolver: all selected/pasted docs -> ONE row of multivalue
+    # candidate columns (VALUES aggregates across docs, ignores nulls)
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: |
+        FROM logs-*,.alerts* METADATA _id
+        | WHERE _id IN ("{{ inputs.doc_ids | split: ',' | join: '","' }}")
+             OR _id IN ("{{ event.documents | map: 'id' | join: '","' }}")
+             OR _id IN ("{{ inputs.event.alertIds | map: '_id' | join: '","' }}")
+        // # comma-separated inputs and multi-selections each render as
+        // # "id1","id2",... ; absent sources render "" which matches nothing
+        | EVAL target_id = CASE(
+            kibana.alert.ancestors.id IS NOT NULL, TO_STRING(MV_FIRST(kibana.alert.ancestors.id)),
+            TO_STRING(_id))
+        // # alerts resolve to their SOURCE event; log docs to themselves
+        | STATS client_ips = VALUES(TO_STRING(MV_FIRST(client.ip))),
+                host_ips = VALUES(TO_STRING(MV_FIRST(host.ip))),
+                destination_ips = VALUES(TO_STRING(MV_FIRST(destination.ip))),
+                source_ips = VALUES(TO_STRING(MV_FIRST(source.ip))),
+                target_ids = VALUES(target_id)
+        // # one row out; each column is a multivalue list across all docs
+
+  - name: ip_lookup
+    type: elasticsearch.esql.query
+    with:
+      format: "json"
+      query: |
+        FROM
+          (
+            FROM logs-* METADATA _id, _index
+            | WHERE TO_STRING(client.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR TO_STRING(host.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR TO_STRING(destination.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+                OR TO_STRING(source.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+            // # candidate set = typed IPs + every doc-derived IP; the join filter
+            // # flattens each multivalue list into "ip1","ip2",...; empties are inert
+            | EVAL matched_ip = CASE(
+                TO_STRING(client.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(client.ip),
+                TO_STRING(host.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(host.ip),
+                TO_STRING(destination.ip) IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}"), TO_STRING(destination.ip),
+                TO_STRING(source.ip))
+            | EVAL is_selected = _id IN ("{{ steps.get_doc_ips.output.values[0][4] | join: '","' }}")
+            // # tag docs the user actually picked (or alert source events)
+            | KEEP matched_ip, event.module, _id, _index, is_selected
+          ),
+          (
+            FROM hr_directory
+            | WHERE IP_Address IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][0] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][1] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][2] | join: '","' }}", "{{ steps.get_doc_ips.output.values[0][3] | join: '","' }}")
+            | EVAL matched_ip = IP_Address
+            | KEEP matched_ip, First_Name, Last_Name, Department, `Sub-Department`, Start_Date
+          )
+        | EVAL data_type = CASE(
+            event.module IS NOT NULL, "Dataset",
+            _id IS NOT NULL, "Doc_ID",
+            _index IS NOT NULL, "Index",
+            Department IS NOT NULL, "HR",
+            "Other"
+          )
+        | STATS
+            log_events = COUNT(*) WHERE _id IS NOT NULL,
+            hr_matches = COUNT(*) WHERE data_type == "HR",
+            First_Name = VALUES(First_Name),
+            Last_Name = VALUES(Last_Name),
+            Department = VALUES(Department),
+            `Sub-Department` = VALUES(`Sub-Department`),
+            Start_Date = VALUES(Start_Date),
+            Dataset = VALUES(event.module),
+            Doc_ID = VALUES(_id),
+            Index = VALUES(_index),
+            Selected_IDs = COALESCE(VALUES(CASE(is_selected, TO_STRING(_id), NULL)), "_none_")
+            // # column 10: THIS employee's selected docs only - keeps multi-doc
+            // # batches from cross-stamping; "_none_" keeps the ids query valid
+          BY matched_ip
+          // # column 11 now (was 10) - one row per employee, as always
+        | WHERE log_events > 0 AND hr_matches > 0
+        | EVAL Trail_IP = CASE(
+            matched_ip IN ("{{ inputs.ip_addresses | split: ',' | join: '","' }}"), matched_ip,
+            "255.255.255.255")
+        // # column 12: the per-employee mode fuse - their real IP only if it was
+        // # TYPED (trail fan-out); doc-selected employees get the inert broadcast
+
+  - name: enrich_matched_docs
+    type: foreach
+    foreach: "{{ steps.ip_lookup.output.values }}"
+    steps:
+      - name: copy_to_probation
+        type: elasticsearch.request
+        with:
+          method: "POST"
+          path: "/_reindex?refresh=true"
+          body:
+            conflicts: "proceed"
+            source:
+              index: "logs-*"
+              query:
+                bool:
+                  minimum_should_match: 1
+                  should:
+                    - ids:
+                        values: "${{ foreach.item[10] }}"
+                        # Selected_IDs (col 10): typed ${{ }} passes the per-employee
+                        # multivalue as a real array; "_none_" sentinel in IP-only mode
+                    - bool:
+                        minimum_should_match: 1
+                        should:
+                          - term: { "client.ip": "{{ foreach.item[12] }}" }
+                          - term: { "host.ip": "{{ foreach.item[12] }}" }
+                          - term: { "destination.ip": "{{ foreach.item[12] }}" }
+                          - term: { "source.ip": "{{ foreach.item[12] }}" }
+                        # Trail_IP (col 12): real IP for typed employees -> trail;
+                        # broadcast for doc-selected employees -> matches nothing
+            dest:
+              index: "logs_on_double_secret_probation"
+            script:
+              lang: "painless"
+              source: |
+                if (ctx._source.enriched == null) {
+                  ctx._source.enriched = new HashMap();
+                } // create the enriched object first if it doesn't exist yet
+                ctx._source.enriched.First_Name     = params.first_name;
+                ctx._source.enriched.Last_Name      = params.last_name;
+                ctx._source.enriched.Department     = params.department;
+                ctx._source.enriched.Sub_Department = params.sub_department;
+                ctx._source.enriched.Start_Date     = params.start_date;
+              params:
+                first_name: "${{ foreach.item[2] }}"
+                last_name: "${{ foreach.item[3] }}"
+                department: "${{ foreach.item[4] }}"
+                sub_department: "${{ foreach.item[5] }}"
+                start_date: "${{ foreach.item[6] }}"
