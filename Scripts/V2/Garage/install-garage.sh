@@ -30,6 +30,15 @@ GARAGE_REGION="garage"                          # S3 region name clients must us
 # Release to install. Pin a tag from https://garagehq.deuxfleurs.fr/download/
 GARAGE_VERSION="v2.3.0"                         # requires >= v2.3.0 for --single-node
 
+# Data generators (gen_*.py + identity.py + garage_s3.py). If the directory
+# exists, the installer runs them with --s3 after Garage is healthy.
+# Set SKIP_DATAGEN=1 in the environment to install Garage only.
+GEN_DIR="/home/elastic/ESQL-DataFederation/Scripts/V2/Garage"
+GEN_OUT_DIR="${GEN_DIR}/output"                 # local artifacts land here
+TXN_ROWS="${TXN_ROWS:-1000000}"                 # gen_parquet.py --rows
+LOG_ROWS="${LOG_ROWS:-500000}"                  # gen_parquet_logs.py --rows
+ORDER_ROWS="${ORDER_ROWS:-500000}"              # gen_parquet_orders.py --rows
+
 GARAGE_BIN="/usr/local/bin/garage"
 CONFIG_FILE="/etc/garage.toml"
 ENV_FILE="/etc/default/garage"
@@ -52,7 +61,8 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 APT_OPTS=(-o DPkg::Lock::Timeout=120 -o Acquire::ForceIPv4=true
           -o Acquire::http::Timeout=15 -o Acquire::Retries=3)
-apt-get "${APT_OPTS[@]}" install -y curl ca-certificates openssl
+apt-get "${APT_OPTS[@]}" install -y curl ca-certificates openssl \
+  python3 python3-pip
 
 # ---------------------------------------------------------------------------
 # 2. Architecture detection
@@ -223,6 +233,53 @@ log "Allowing '${GARAGE_ACCESS_KEY}' to create additional buckets"
   || warn "Could not grant create-bucket (run manually: garage key allow --create-bucket ${GARAGE_ACCESS_KEY})"
 
 # ---------------------------------------------------------------------------
+# 10. Synthetic data generation -> Garage
+# ---------------------------------------------------------------------------
+# Runs the V2 generators with --s3. Their built-in defaults already match this
+# installer (endpoint :9000, region garage, bucket datafederation, creds
+# above), so no extra wiring is needed — garage_s3.py next to the generators
+# does the upload. Local copies of every artifact are kept in ${GEN_OUT_DIR}.
+if [[ "${SKIP_DATAGEN:-0}" == "1" ]]; then
+  warn "SKIP_DATAGEN=1 — skipping data generation"
+elif [[ ! -d "$GEN_DIR" ]]; then
+  warn "Generator directory not found: ${GEN_DIR} — skipping data generation"
+else
+  for f in identity.py garage_s3.py gen_hr_csv.py gen_parquet.py \
+           gen_parquet_logs.py gen_parquet_orders.py; do
+    [[ -f "${GEN_DIR}/${f}" ]] || die "Missing ${GEN_DIR}/${f}"
+  done
+
+  log "Installing Python dependencies (boto3, pyarrow)"
+  pip3 install --break-system-packages -q boto3 pyarrow \
+    || die "pip3 install failed"
+
+  mkdir -p "$GEN_OUT_DIR"
+  cd "$GEN_OUT_DIR"
+
+  log "Generating HR roster (${GEN_DIR}/gen_hr_csv.py)"
+  python3 "${GEN_DIR}/gen_hr_csv.py" --parquet hr_roster.parquet --s3 \
+    || die "gen_hr_csv.py failed"
+
+  log "Generating transaction archive (${TXN_ROWS} rows — this takes a while)"
+  python3 "${GEN_DIR}/gen_parquet.py" --rows "$TXN_ROWS" --s3 \
+    || die "gen_parquet.py failed"
+
+  log "Generating application logs (${LOG_ROWS} rows)"
+  python3 "${GEN_DIR}/gen_parquet_logs.py" --rows "$LOG_ROWS" --s3 \
+    || die "gen_parquet_logs.py failed"
+
+  log "Generating order documents (${ORDER_ROWS} rows)"
+  python3 "${GEN_DIR}/gen_parquet_orders.py" --rows "$ORDER_ROWS" --s3 \
+    || die "gen_parquet_orders.py failed"
+
+  # local artifacts belong to whoever owns the repo checkout, not root
+  OWNER="$(stat -c '%U:%G' "$GEN_DIR" 2>/dev/null || echo root:root)"
+  chown -R "$OWNER" "$GEN_OUT_DIR" 2>/dev/null || true
+  cd - >/dev/null
+  DATAGEN_DONE=1
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -241,6 +298,11 @@ cat <<EOF
  Service      : systemctl status garage
  Logs         : journalctl -u garage -f
  Admin CLI    : garage -c ${CONFIG_FILE} status | key list | bucket list
+ Data         : $(if [[ "${DATAGEN_DONE:-0}" == "1" ]]; then
+                   echo "generated -> s3://${GARAGE_BUCKET}/{hr,transactions,logs,orders}/ (local: ${GEN_OUT_DIR})"
+                 else
+                   echo "not generated (see warnings above)"
+                 fi)
 
  aws-cli example:
    export AWS_ACCESS_KEY_ID='${GARAGE_ACCESS_KEY}'
