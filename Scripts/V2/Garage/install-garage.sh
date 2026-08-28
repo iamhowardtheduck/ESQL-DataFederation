@@ -279,8 +279,8 @@ else
   python3 "${GEN_DIR}/gen_parquet_logs.py" --rows "$LOG_ROWS" --s3 \
     || die "gen_parquet_logs.py failed"
 
-  log "Generating order documents (${ORDER_ROWS} rows)"
-  python3 "${GEN_DIR}/gen_parquet_orders.py" --rows "$ORDER_ROWS" --s3 \
+  log "Generating order documents (${ORDER_ROWS} rows, NDJSON)"
+  python3 "${GEN_DIR}/gen_parquet_orders.py" --rows "$ORDER_ROWS" --ndjson-only --s3 \
     || die "gen_parquet_orders.py failed"
 
   cd - >/dev/null
