@@ -501,6 +501,9 @@ def main():
     ap.add_argument("--out", default="orders.parquet")
     ap.add_argument("--ndjson", default=None,
                     help="also write newline-delimited JSON to this path")
+    ap.add_argument("--ndjson-only", action="store_true",
+                    help="write only NDJSON (skip the parquet file); "
+                         "implies --ndjson orders.ndjson unless --ndjson is set")
     ap.add_argument("--pretty-rate", type=float, default=0.0,
                     help="fraction of documents pretty-printed (default compact)")
     ap.add_argument("--sample", type=int, default=0,
@@ -531,25 +534,33 @@ def main():
         else:
             messages.append(json.dumps(doc, separators=(",", ":")))
 
+    if args.ndjson_only and not args.ndjson:
+        args.ndjson = "orders.ndjson"
+
     table = pa.table({"message": pa.array(messages, type=pa.string())})
-    pq.write_table(table, args.out, compression="snappy", row_group_size=50_000)
+    if not args.ndjson_only:
+        pq.write_table(table, args.out, compression="snappy", row_group_size=50_000)
 
     if args.ndjson:
         with open(args.ndjson, "w", encoding="utf-8") as fh:
             for m in messages:
                 fh.write(m.replace("\n", " ") + "\n")
 
-    size = os.path.getsize(args.out) / 1e6
     raw = sum(len(m) for m in messages) / 1e6
-    print(f"wrote {args.out}: {table.num_rows:,} rows x 1 col "
-          f"({size:.1f} MB on disk, {raw:.1f} MB raw JSON)")
+    if args.ndjson_only:
+        print(f"wrote {args.ndjson}: {table.num_rows:,} docs "
+              f"({os.path.getsize(args.ndjson) / 1e6:.1f} MB NDJSON)")
+    else:
+        size = os.path.getsize(args.out) / 1e6
+        print(f"wrote {args.out}: {table.num_rows:,} rows x 1 col "
+              f"({size:.1f} MB on disk, {raw:.1f} MB raw JSON)")
     print(f"  window    : {start:%Y-%m-%d} .. {now:%Y-%m-%d}")
     print(f"  customers : {args.customers:,} distinct")
     print(f"  markets   : {len(MARKETS)} countries, "
           f"{len({m[2] for m in MARKETS})} currencies")
     print(f"  catalog   : {sum(len(v) for v in CATALOG.values())} products "
           f"across {len(CATALOG)} categories")
-    if args.ndjson:
+    if args.ndjson and not args.ndjson_only:
         print(f"  ndjson    : {args.ndjson} "
               f"({os.path.getsize(args.ndjson) / 1e6:.1f} MB)")
 
@@ -558,7 +569,10 @@ def main():
         if S3 is None:
             raise SystemExit("--s3 requires garage_s3.py next to this script")
         print()
-        S3.push(args, files=[args.out, args.ndjson])
+        if args.ndjson_only:
+            S3.push(args, files=[args.ndjson])
+        else:
+            S3.push(args, files=[args.out, args.ndjson])
 
 
 if __name__ == "__main__":
