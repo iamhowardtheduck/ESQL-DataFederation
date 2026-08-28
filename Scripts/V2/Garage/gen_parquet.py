@@ -65,6 +65,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 
@@ -549,8 +550,8 @@ def main():
                        row_group_size=100_000)
         target = args.out
     else:
-        years = pa.compute.year(table["timestamp"])
-        months = pa.compute.month(table["timestamp"])
+        years = pc.year(table["timestamp"])
+        months = pc.month(table["timestamp"])
         table = table.append_column("year", years.cast(pa.int32())) \
                      .append_column("month", months.cast(pa.int32()))
         pq.write_to_dataset(
