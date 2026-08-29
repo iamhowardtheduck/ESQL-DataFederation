@@ -266,22 +266,39 @@ else
 
   mkdir -p "$GEN_OUT_DIR"
   cd "$GEN_OUT_DIR"
+  DG_HR="$(mktemp)"; DG_TXN="$(mktemp)"; DG_LOGS="$(mktemp)"; DG_ORD="$(mktemp)"
 
   log "Generating HR roster (${GEN_DIR}/gen_hr_csv.py)"
-  python3 "${GEN_DIR}/gen_hr_csv.py" --parquet hr_roster.parquet --s3 \
-    || die "gen_hr_csv.py failed"
+  python3 "${GEN_DIR}/gen_hr_csv.py" --parquet hr_roster.parquet --s3 2>&1 \
+    | tee "$DG_HR" || die "gen_hr_csv.py failed"
+
+  log "Creating gzip tarball: hr_roster.csv.tar.gz"
+  tar -czf hr_roster.csv.tar.gz hr_roster.csv \
+    || die "tar failed"
+  python3 - <<PYEOF || die "tar.gz upload failed"
+import boto3
+from botocore.config import Config
+s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:${GARAGE_S3_PORT}",
+                  region_name="${GARAGE_REGION}",
+                  aws_access_key_id="${GARAGE_ACCESS_KEY}",
+                  aws_secret_access_key="${GARAGE_SECRET_KEY}",
+                  config=Config(s3={"addressing_style": "path"}))
+s3.upload_file("hr_roster.csv.tar.gz", "${GARAGE_BUCKET}",
+               "hr/hr_roster.csv.tar.gz")
+print("  s3        : s3://${GARAGE_BUCKET}/hr/hr_roster.csv.tar.gz")
+PYEOF
 
   log "Generating transaction archive (${TXN_ROWS} rows — this takes a while)"
-  python3 "${GEN_DIR}/gen_parquet.py" --rows "$TXN_ROWS" --s3 \
-    || die "gen_parquet.py failed"
+  python3 "${GEN_DIR}/gen_parquet.py" --rows "$TXN_ROWS" --s3 2>&1 \
+    | tee "$DG_TXN" || die "gen_parquet.py failed"
 
   log "Generating application logs (${LOG_ROWS} rows)"
-  python3 "${GEN_DIR}/gen_parquet_logs.py" --rows "$LOG_ROWS" --s3 \
-    || die "gen_parquet_logs.py failed"
+  python3 "${GEN_DIR}/gen_parquet_logs.py" --rows "$LOG_ROWS" --s3 2>&1 \
+    | tee "$DG_LOGS" || die "gen_parquet_logs.py failed"
 
   log "Generating order documents (${ORDER_ROWS} rows, NDJSON)"
-  python3 "${GEN_DIR}/gen_parquet_orders.py" --rows "$ORDER_ROWS" --ndjson-only --s3 \
-    || die "gen_parquet_orders.py failed"
+  python3 "${GEN_DIR}/gen_parquet_orders.py" --rows "$ORDER_ROWS" --ndjson-only --s3 2>&1 \
+    | tee "$DG_ORD" || die "gen_parquet_orders.py failed"
 
   cd - >/dev/null
   DATAGEN_DONE=1
@@ -290,34 +307,63 @@ fi
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+HOSTN="$(hostname -s 2>/dev/null || hostname)"
+ENDPOINT="http://${HOSTN}:${GARAGE_S3_PORT}"
+
+# Full install details (incl. admin token) are kept out of the final screen
+# but preserved for the operator:
+SUMMARY_FILE="${BASE_DIR}/install-summary.txt"
+cat > "$SUMMARY_FILE" <<EOF
+Garage rootless install — $(date -u +%Y-%m-%dT%H:%M:%SZ)
+S3 API       : ${ENDPOINT} (path-style, region: ${GARAGE_REGION})
+Admin API    : http://${HOSTN}:${GARAGE_ADMIN_PORT} (Authorization: Bearer <token>)
+Admin token  : ${ADMIN_TOKEN}
+Access key   : ${GARAGE_ACCESS_KEY}
+Secret key   : ${GARAGE_SECRET_KEY}
+Bucket       : ${GARAGE_BUCKET}
+Meta dir     : ${GARAGE_META_DIR}
+Data dir     : ${GARAGE_DATA_DIR}
+Service      : ${CTL} {start|stop|restart|status|logs}
+Admin CLI    : ${CTL} cli status | key list | bucket list
+EOF
+chmod 600 "$SUMMARY_FILE"
+
+if [[ "${DATAGEN_DONE:-0}" != "1" ]]; then
+  warn "Data generation did not run (see warnings above)."
+  warn "Garage itself is up — details in ${SUMMARY_FILE}"
+  exit 0
+fi
+
+# Pull the real counts/windows from the generators' own output, with fallbacks.
+HR_COUNT="$(grep -oE 'wrote hr_roster\.csv: [0-9,]+' "$DG_HR" | grep -oE '[0-9,]+$' || echo '?')"
+TXN_WINDOW="$(grep -oE 'window[[:space:]]*: [0-9-]+ \.\. [0-9-]+' "$DG_TXN" | head -1 | sed 's/window[[:space:]]*: //' || true)"
+ORD_WINDOW="$(grep -oE 'window[[:space:]]*: [0-9-]+ \.\. [0-9-]+' "$DG_ORD" | head -1 | sed 's/window[[:space:]]*: //' || true)"
+TXN_WINDOW="${TXN_WINDOW:-last 7 years}"
+ORD_WINDOW="${ORD_WINDOW:-last 2 years}"
+rm -f "$DG_HR" "$DG_TXN" "$DG_LOGS" "$DG_ORD"
+
+# Final screen
+clear 2>/dev/null || printf '\033c'
 cat <<EOF
-────────────────────────────────────────────────────────────
- Garage is running (rootless, as $(whoami))
-────────────────────────────────────────────────────────────
- S3 API       : http://${IP:-<host>}:${GARAGE_S3_PORT}   (path-style, region: ${GARAGE_REGION})
- Admin API    : http://${IP:-<host>}:${GARAGE_ADMIN_PORT} (Bearer token below)
- Access key   : ${GARAGE_ACCESS_KEY}
- Secret key   : ${GARAGE_SECRET_KEY}
- Admin token  : ${ADMIN_TOKEN}
- Bucket       : ${GARAGE_BUCKET}
- Meta dir     : ${GARAGE_META_DIR}
- Data dir     : ${GARAGE_DATA_DIR}
- Service      : ${CTL} {start|stop|restart|status}
- Logs         : ${CTL} logs
- Admin CLI    : ${CTL} cli status   (also: key list, bucket list, ...)
- Data         : $(if [[ "${DATAGEN_DONE:-0}" == "1" ]]; then
-                   echo "generated -> s3://${GARAGE_BUCKET}/{hr,transactions,logs,orders}/ (local: ${GEN_OUT_DIR})"
-                 else
-                   echo "not generated (see warnings above)"
-                 fi)
 
- NOTE: no root was used. Firewall/security-group ports ${GARAGE_S3_PORT} and
- ${GARAGE_ADMIN_PORT} must already be reachable if remote access is needed.
+ Datasets generated in Garage (bucket: ${GARAGE_BUCKET})
+ ─────────────────────────────────────────────────────────────────────────────
+ 1. HR roster       CSV + Parquet   ${HR_COUNT} docs   current snapshot
+                    s3://${GARAGE_BUCKET}/hr/hr_roster.csv
+                    s3://${GARAGE_BUCKET}/hr/hr_roster.csv.tar.gz (gzip copy)
+                    s3://${GARAGE_BUCKET}/hr/hr_roster.parquet
+ 2. Transactions    Parquet         ${TXN_ROWS} docs   ${TXN_WINDOW}
+                    s3://${GARAGE_BUCKET}/transactions/**/*.parquet
+ 3. App logs        Parquet         ${LOG_ROWS} docs   last 30 days
+                    s3://${GARAGE_BUCKET}/logs/app_logs.parquet
+ 4. Orders          NDJSON          ${ORDER_ROWS} docs   ${ORD_WINDOW}
+                    s3://${GARAGE_BUCKET}/orders/orders.ndjson
+ ─────────────────────────────────────────────────────────────────────────────
+ Endpoint   : ${ENDPOINT}
+ Region     : ${GARAGE_REGION}
+ Access key : ${GARAGE_ACCESS_KEY}
+ Secret key : ${GARAGE_SECRET_KEY}
 
- aws-cli example:
-   export AWS_ACCESS_KEY_ID='${GARAGE_ACCESS_KEY}'
-   export AWS_SECRET_ACCESS_KEY='${GARAGE_SECRET_KEY}'
-   aws --endpoint-url http://127.0.0.1:${GARAGE_S3_PORT} --region ${GARAGE_REGION} s3 ls
-────────────────────────────────────────────────────────────
+You are now ready to begin the assignment.
+
 EOF
