@@ -24,7 +24,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-GARAGE_ACCESS_KEY="minioadmin"                  # kept for MinIO drop-in compat
+GARAGE_ACCESS_KEY="garageadmin"                  # kept for MinIO drop-in compat
 GARAGE_SECRET_KEY='datafederation_hooray!'
 GARAGE_BUCKET="datafederation"                  # default bucket created at boot
 
