@@ -36,7 +36,7 @@ GARAGE_S3_VERSION = "1"
 DEFAULT_ENDPOINT = "http://127.0.0.1:9000"
 DEFAULT_REGION = "garage"
 DEFAULT_BUCKET = "datafederation"
-DEFAULT_ACCESS_KEY = "minioadmin"
+DEFAULT_ACCESS_KEY = "garageadmin"
 DEFAULT_SECRET_KEY = "datafederation_hooray!"
 
 
