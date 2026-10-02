@@ -20,7 +20,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration (must match install-garage.sh / garage_s3.py defaults)
 # ---------------------------------------------------------------------------
-GARAGE_ACCESS_KEY="minioadmin"
+GARAGE_ACCESS_KEY="garageadmin"
 GARAGE_SECRET_KEY='datafederation_hooray!'
 GARAGE_BUCKET="datafederation"
 GARAGE_S3_PORT="9000"
