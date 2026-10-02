@@ -276,6 +276,11 @@ else
   tar -czf hr_roster.csv.tar.gz hr_roster.csv \
     || die "tar failed"
   python3 - <<PYEOF || die "tar.gz upload failed"
+
+
+ln -sf /home/elastic/.local/bin/garage /usr/local/bin/garage
+ln -sf /home/elastic/garage/garage.toml /etc/garage.toml
+
 import boto3
 from botocore.config import Config
 s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:${GARAGE_S3_PORT}",
